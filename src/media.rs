@@ -384,6 +384,11 @@ where
             last = Some(fail(401, format!("token refresh failed: {e}")));
             continue;
         }
+        if let Err(e) = crate::quota::require_subscription(app, &acct, &model).await {
+            let msg = format!("subscription-only request refused: {e}");
+            tracker.finish(429, &Usage::default(), Some(msg.clone()));
+            return Err(fail(429, msg));
+        }
         match op(acct.clone(), upstream_model).await {
             Ok(v) => {
                 acct.record_ok();

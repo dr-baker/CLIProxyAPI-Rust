@@ -31,6 +31,10 @@ pub struct Config {
     pub routing: Routing,
     /// Keep an upstream websocket open to Codex when clients connect over websocket.
     pub codex_websockets: bool,
+    /// Serve only first-party Codex OAuth accounts after checking subscription allowance.
+    pub codex_subscription_only: bool,
+    /// Stop admitting requests when any subscription window reaches this percentage.
+    pub subscription_usage_ceiling_percent: f64,
     /// Rewrite non-Claude-Code requests on Claude OAuth accounts so they look like Claude Code.
     pub claude_cloak: bool,
     pub debug: bool,
@@ -191,6 +195,8 @@ impl Default for Config {
             request_retry: 3,
             routing: Routing::LeastUsed,
             codex_websockets: true,
+            codex_subscription_only: false,
+            subscription_usage_ceiling_percent: 90.0,
             claude_cloak: true,
             debug: false,
             tls: Tls::default(),
@@ -226,6 +232,8 @@ proxy-url: ""               # optional upstream proxy, e.g. socks5://127.0.0.1:1
 request-retry: 3            # accounts to try before failing a request
 routing: least-used         # least-used (most quota left) | round-robin | fill-first
 codex-websockets: true      # native upstream websocket for Codex websocket clients
+codex-subscription-only: false # OAuth only; check subscription allowance before every request
+subscription-usage-ceiling-percent: 90.0
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false
 
@@ -304,6 +312,12 @@ impl Config {
         let mut doc: Yaml = serde_yaml::from_str(text).context("invalid config")?;
         let ignored = crate::compat::normalize(&mut doc);
         let mut cfg: Config = serde_yaml::from_value(doc).context("invalid config")?;
+        anyhow::ensure!(
+            cfg.subscription_usage_ceiling_percent.is_finite()
+                && cfg.subscription_usage_ceiling_percent > 0.0
+                && cfg.subscription_usage_ceiling_percent <= 100.0,
+            "subscription-usage-ceiling-percent must be greater than 0 and at most 100"
+        );
         cfg.ignored = ignored;
         Ok(cfg)
     }
@@ -314,5 +328,30 @@ impl Config {
 
     pub fn is_loopback(&self) -> bool {
         matches!(self.host.as_str(), "127.0.0.1" | "localhost" | "::1")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_settings_default_to_off() {
+        let cfg = Config::parse("").unwrap();
+        assert!(!cfg.codex_subscription_only);
+        assert_eq!(cfg.subscription_usage_ceiling_percent, 90.0);
+    }
+
+    #[test]
+    fn subscription_settings_parse() {
+        let cfg = Config::parse(
+            "codex-subscription-only: true\nsubscription-usage-ceiling-percent: 85\n",
+        )
+        .unwrap();
+        assert!(cfg.codex_subscription_only);
+        assert_eq!(cfg.subscription_usage_ceiling_percent, 85.0);
+        for value in ["0", "-1", "101", ".nan", ".inf"] {
+            assert!(Config::parse(&format!("subscription-usage-ceiling-percent: {value}")).is_err());
+        }
     }
 }

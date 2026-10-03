@@ -280,6 +280,10 @@ impl OAuth {
     pub fn field(&self, key: &str) -> Option<&str> {
         self.raw.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
     }
+
+    pub fn uses_codex_backend(&self) -> bool {
+        self.base_url.as_ref().is_none_or(|base| base.trim_end_matches('/') == crate::upstream::CODEX_BACKEND)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -381,6 +385,10 @@ impl Account {
 
     pub fn is_oauth(&self) -> bool {
         matches!(*self.cred.read(), Credential::OAuth(_))
+    }
+
+    pub fn is_codex_subscription(&self) -> bool {
+        self.provider == Provider::Codex && matches!(&*self.cred.read(), Credential::OAuth(o) if o.uses_codex_backend())
     }
 
     /// Upstream model name if this account can serve `model`.
@@ -688,6 +696,9 @@ fn collect(cfg: &Config) -> Vec<Spec> {
             continue;
         }
         let Some((provider, oauth, disabled, map)) = read_oauth_file(&path) else { continue };
+        if cfg.codex_subscription_only && (provider != Provider::Codex || !oauth.uses_codex_backend()) {
+            continue;
+        }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let device_id = map
             .get("claude_device_ids")
@@ -730,6 +741,9 @@ fn collect(cfg: &Config) -> Vec<Spec> {
             disabled,
             device_id,
         });
+    }
+    if cfg.codex_subscription_only {
+        return specs;
     }
     let keys = [
         (Provider::Claude, &cfg.claude_api_key),
@@ -810,6 +824,7 @@ pub struct Pool {
     cursor: Mutex<HashMap<String, usize>>,
     /// `force-model-prefix`: unprefixed names skip accounts that have a prefix.
     force_prefix: std::sync::atomic::AtomicBool,
+    subscription_only: std::sync::atomic::AtomicBool,
 }
 
 /// Restricts a request to some accounts (`provider/model` or `prefix/model`).
@@ -829,6 +844,7 @@ pub enum Pick {
 impl Pool {
     pub fn reload(&self, cfg: &Config) {
         self.force_prefix.store(cfg.force_model_prefix, std::sync::atomic::Ordering::Relaxed);
+        self.subscription_only.store(cfg.codex_subscription_only, std::sync::atomic::Ordering::Relaxed);
         let specs = collect(cfg);
         let old: HashMap<String, Arc<Account>> =
             self.accounts.read().iter().map(|a| (a.id.clone(), a.clone())).collect();
@@ -836,7 +852,8 @@ impl Pool {
         for s in specs {
             if let Some(prev) = old.get(&s.id) {
                 // Keep counters and cooldowns; refresh credentials from disk/config.
-                let same_shape = prev.models.len() == s.models.len()
+                let same_shape = prev.provider == s.provider
+                    && prev.models.len() == s.models.len()
                     && prev.headers == s.headers
                     && prev.proxy_url == s.proxy_url
                     && prev.prefix == s.prefix
@@ -882,6 +899,7 @@ impl Pool {
                 && p.exists()
                 && !next.iter().any(|a| a.id == *id)
                 && read_oauth_file(p).is_none()
+                && (!cfg.codex_subscription_only || prev.is_codex_subscription())
             {
                 next.push(prev.clone());
             }
@@ -1003,7 +1021,11 @@ impl Pool {
                 Some(Only::Prefix(x)) => a.prefix.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(x)),
                 None => !(force && a.prefix.is_some()),
             };
-            if !allowed || exclude.contains(&a.id) || a.state.lock().disabled {
+            if !allowed
+                || exclude.contains(&a.id)
+                || a.state.lock().disabled
+                || (self.subscription_only.load(std::sync::atomic::Ordering::Relaxed) && !a.is_codex_subscription())
+            {
                 continue;
             }
             let forced = matches!(only, Some(Only::Provider(_)));
@@ -1058,6 +1080,80 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_mode_loads_only_official_codex_oauth() {
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TestDir(std::env::temp_dir().join(format!("cliproxy-subscription-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let oauth = OAuth {
+            access_token: "synthetic-token".into(),
+            account_id: Some("synthetic-account".into()),
+            ..Default::default()
+        };
+        write_oauth_file(&dir.0.join("official.json"), Provider::Codex, &oauth, &[]).unwrap();
+        write_oauth_file(&dir.0.join("claude.json"), Provider::Claude, &oauth, &[]).unwrap();
+        let custom = OAuth { base_url: Some("https://gateway.example/v1".into()), ..oauth };
+        write_oauth_file(&dir.0.join("custom.json"), Provider::Codex, &custom, &[]).unwrap();
+        let cfg = Config {
+            auth_dir: dir.0.to_string_lossy().into_owned(),
+            codex_subscription_only: true,
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "synthetic-key".into(), ..Default::default() }],
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "synthetic-key".into(), ..Default::default() }],
+            openai_compatibility: vec![crate::config::CompatEntry {
+                name: "gateway".into(),
+                base_url: "https://gateway.example/v1".into(),
+                api_keys: vec!["synthetic-key".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        assert_eq!(pool.all().len(), 1);
+        let Pick::Ok(acct, _) = pool.pick("gpt-6.1-sol", &[], Routing::LeastUsed, None, None) else {
+            panic!("official OAuth account should be selectable");
+        };
+        assert!(acct.is_codex_subscription());
+        assert_eq!(acct.id, "file:official.json");
+    }
+
+    #[test]
+    fn subscription_picker_rejects_retained_api_keys() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "synthetic-key".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let key = pool.all().pop().unwrap();
+        assert!(matches!(pool.pick("gpt-6.1-sol", &[], Routing::LeastUsed, None, None), Pick::Ok(..)));
+        pool.subscription_only.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(pool.pick("gpt-6.1-sol", &[], Routing::LeastUsed, Some(&key.id), None), Pick::None));
+    }
+
+    #[test]
+    fn codex_backend_override_must_match_the_official_endpoint() {
+        assert!(OAuth::default().uses_codex_backend());
+        assert!(
+            OAuth { base_url: Some(format!("{}/", crate::upstream::CODEX_BACKEND)), ..Default::default() }
+                .uses_codex_backend()
+        );
+        for base in [
+            "http://chatgpt.com/backend-api/codex",
+            "https://api.openai.com/v1",
+            "https://chatgpt.com.attacker.example/backend-api/codex",
+            "",
+        ] {
+            assert!(!OAuth { base_url: Some(base.into()), ..Default::default() }.uses_codex_backend());
+        }
+    }
 
     #[test]
     fn aggregator_names_stay_with_aggregators() {

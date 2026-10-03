@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -190,6 +191,106 @@ fn codex_windows(v: &Value) -> Vec<Window> {
         .collect()
 }
 
+fn subscription_credentials(acct: &Account) -> Result<(String, String)> {
+    ensure!(acct.provider == Provider::Codex, "subscription-only mode requires a Codex account");
+    let cred = acct.cred.read();
+    let Credential::OAuth(o) = &*cred else {
+        bail!("subscription-only mode does not permit API keys");
+    };
+    ensure!(o.uses_codex_backend(), "subscription-only mode does not permit a custom upstream URL");
+    ensure!(!o.access_token.trim().is_empty(), "missing Codex OAuth access token");
+    let account_id =
+        o.account_id.as_deref().filter(|id| !id.trim().is_empty()).context("missing ChatGPT account ID")?;
+    Ok((o.access_token.clone(), account_id.to_string()))
+}
+
+async fn codex_usage(app: &App, acct: &Account, token: &str, account_id: Option<&str>) -> Result<Value> {
+    let mut rb = app
+        .http
+        .client(acct.proxy_url.as_deref())
+        .get(CODEX_USAGE)
+        .bearer_auth(token)
+        .header("user-agent", crate::upstream::CODEX_USER_AGENT)
+        .header("originator", crate::upstream::CODEX_ORIGINATOR)
+        .timeout(Duration::from_secs(15));
+    if let Some(id) = account_id {
+        rb = rb.header("chatgpt-account-id", id);
+    }
+    rb.send().await?.error_for_status()?.json().await.context("invalid ChatGPT usage response")
+}
+
+fn checked_subscription_limit(rl: &Value, name: &str, ceiling: f64, now: DateTime<Utc>) -> Result<Vec<Window>> {
+    ensure!(rl["allowed"] == true, "{name} subscription allowance is unavailable");
+    ensure!(rl["limit_reached"] == false, "{name} subscription allowance is exhausted or unknown");
+    let mut windows = Vec::new();
+    for key in ["primary_window", "secondary_window"] {
+        let w = &rl[key];
+        if w.is_null() {
+            continue;
+        }
+        let secs =
+            w["limit_window_seconds"].as_i64().filter(|s| *s > 0).context("invalid subscription window length")?;
+        let used = w["used_percent"].as_f64().context("missing subscription usage percentage")?;
+        ensure!(used.is_finite() && (0.0..=100.0).contains(&used), "invalid subscription usage percentage");
+        let reset = w["reset_at"].as_i64().and_then(ts).context("missing or invalid subscription reset time")?;
+        ensure!(reset > now, "subscription usage window has expired; current allowance is unknown");
+        ensure!(used < ceiling, "{name} subscription usage is {used}%, at or above the {ceiling}% ceiling");
+        let window = label(secs);
+        windows.push(Window {
+            name: if name == "Codex" { window } else { format!("{name} {window}") },
+            used,
+            resets_at: Some(reset),
+            model: None,
+        });
+    }
+    ensure!(!windows.is_empty(), "missing {name} subscription usage windows");
+    Ok(windows)
+}
+
+fn subscription_windows(v: &Value, ceiling: f64) -> Result<Vec<Window>> {
+    ensure!(ceiling.is_finite() && ceiling > 0.0 && ceiling <= 100.0, "invalid subscription usage ceiling");
+    ensure!(
+        matches!(v["plan_type"].as_str(), Some("plus" | "pro")),
+        "subscription-only mode requires a ChatGPT Plus or Pro plan"
+    );
+    let now = Utc::now();
+    let mut windows = checked_subscription_limit(&v["rate_limit"], "Codex", ceiling, now)?;
+    if let Some(additional) = v.get("additional_rate_limits").filter(|value| !value.is_null()) {
+        let limits = additional.as_array().context("invalid additional subscription limits")?;
+        for limit in limits {
+            // Without a verified model selector, an additional bucket applies conservatively to every model.
+            let name = limit["limit_name"].as_str().unwrap_or("additional Codex");
+            windows.extend(checked_subscription_limit(&limit["rate_limit"], name, ceiling, now)?);
+        }
+    }
+    // Credits never establish eligibility. Only the subscription windows above authorize a request.
+    Ok(windows)
+}
+
+/// Checks official subscription allowance before each inference, including on reused sockets.
+/// A preflight cannot prevent provider-side credit charges if a request crosses the remaining allowance.
+pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -> Result<()> {
+    let cfg = app.cfg();
+    if !cfg.codex_subscription_only {
+        return Ok(());
+    }
+    let (token, account_id) = subscription_credentials(acct)?;
+    let active = app.pool.get(&acct.id).context("subscription account is no longer configured")?;
+    ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
+    let usage =
+        codex_usage(app, acct, &token, Some(&account_id)).await.context("subscription allowance check failed")?;
+    let windows = subscription_windows(&usage, cfg.subscription_usage_ceiling_percent)
+        .with_context(|| format!("subscription allowance rejected for {model}"))?;
+    let active = app.pool.get(&acct.id).context("subscription account is no longer configured")?;
+    ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
+    ensure!(
+        subscription_credentials(acct)? == (token, account_id),
+        "subscription credentials changed during the allowance check; retry the request"
+    );
+    acct.state.lock().quota.set(windows, usage["plan_type"].as_str().map(String::from));
+    Ok(())
+}
+
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
 pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     let (token, account_id) = match &*acct.cred.read() {
@@ -213,16 +314,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
             (claude_windows(&v), None)
         }
         Provider::Codex => {
-            let mut rb = http
-                .get(CODEX_USAGE)
-                .bearer_auth(&token)
-                .header("user-agent", crate::upstream::CODEX_USER_AGENT)
-                .header("originator", crate::upstream::CODEX_ORIGINATOR)
-                .timeout(Duration::from_secs(15));
-            if let Some(id) = &account_id {
-                rb = rb.header("chatgpt-account-id", id);
-            }
-            let v: Value = rb.send().await?.error_for_status()?.json().await?;
+            let v = codex_usage(app, acct, &token, account_id.as_deref()).await?;
             (codex_windows(&v), v["plan_type"].as_str().map(String::from))
         }
         _ => return Ok(()),
@@ -274,6 +366,173 @@ pub async fn poller(app: Arc<App>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn subscription_usage() -> Value {
+        json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": (Utc::now() + chrono::Duration::hours(1)).timestamp()
+                },
+                "secondary_window": null
+            }
+        })
+    }
+
+    fn account(cred: Credential) -> Account {
+        Account {
+            id: "test".into(),
+            provider: Provider::Codex,
+            label: "test".into(),
+            path: None,
+            group: None,
+            models: vec![],
+            headers: Default::default(),
+            proxy_url: None,
+            cred: parking_lot::RwLock::new(cred),
+            state: parking_lot::Mutex::new(Default::default()),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            device_id: String::new(),
+            session_id: String::new(),
+            discovered: parking_lot::RwLock::new(vec![]),
+            prefix: None,
+            excluded: vec![],
+            aliases: vec![],
+        }
+    }
+
+    #[test]
+    fn subscription_requires_known_available_allowance() {
+        assert!(subscription_windows(&subscription_usage(), 90.0).is_ok());
+        let mut plus = subscription_usage();
+        plus["plan_type"] = "plus".into();
+        assert!(subscription_windows(&plus, 90.0).is_ok());
+        for value in [Value::Null, json!({}), json!({ "plan_type": "pro", "rate_limit": {} })] {
+            assert!(subscription_windows(&value, 90.0).is_err());
+        }
+        for plan in ["free", "team", "business", "enterprise", "edu", "go", "unknown", ""] {
+            let mut usage = subscription_usage();
+            usage["plan_type"] = plan.into();
+            assert!(subscription_windows(&usage, 90.0).is_err());
+        }
+        for field in ["allowed", "limit_reached"] {
+            let mut usage = subscription_usage();
+            usage["rate_limit"].as_object_mut().unwrap().remove(field);
+            assert!(subscription_windows(&usage, 90.0).is_err());
+        }
+        let mut usage = subscription_usage();
+        usage["rate_limit"]["limit_reached"] = true.into();
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        usage["rate_limit"]["limit_reached"] = false.into();
+        usage["rate_limit"]["allowed"] = false.into();
+        assert!(subscription_windows(&usage, 90.0).is_err());
+    }
+
+    #[test]
+    fn subscription_blocks_at_ceiling_and_rejects_invalid_windows() {
+        for used in [90.0, 99.0, 100.0, -1.0, 101.0] {
+            let mut usage = subscription_usage();
+            usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
+            assert!(subscription_windows(&usage, 90.0).is_err());
+        }
+        let mut usage = subscription_usage();
+        usage["rate_limit"]["primary_window"]["used_percent"] = 89.9.into();
+        assert!(subscription_windows(&usage, 90.0).is_ok());
+        usage["rate_limit"]["secondary_window"] = usage["rate_limit"]["primary_window"].clone();
+        usage["rate_limit"]["secondary_window"]["used_percent"] = 90.into();
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        usage["rate_limit"]["secondary_window"] = Value::Null;
+        for reset in [Value::Null, json!(0), json!(-1), json!("tomorrow"), json!(Utc::now().timestamp() - 1)] {
+            let mut usage = subscription_usage();
+            usage["rate_limit"]["primary_window"]["reset_at"] = reset;
+            assert!(subscription_windows(&usage, 90.0).is_err());
+        }
+        for field in ["used_percent", "reset_at", "limit_window_seconds"] {
+            let mut usage = subscription_usage();
+            usage["rate_limit"]["primary_window"].as_object_mut().unwrap().remove(field);
+            assert!(subscription_windows(&usage, 90.0).is_err());
+        }
+        usage["rate_limit"]["primary_window"] = Value::Null;
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        for ceiling in [0.0, -1.0, 101.0, f64::NAN, f64::INFINITY] {
+            assert!(subscription_windows(&subscription_usage(), ceiling).is_err());
+        }
+    }
+
+    #[test]
+    fn credits_never_replace_subscription_allowance() {
+        let mut usage = subscription_usage();
+        usage["credits"] = json!({ "has_credits": true, "unlimited": true, "balance": "1000" });
+        assert!(subscription_windows(&usage, 90.0).is_ok());
+        usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        usage["rate_limit"] = Value::Null;
+        assert!(subscription_windows(&usage, 90.0).is_err());
+    }
+
+    #[test]
+    fn additional_subscription_buckets_cannot_bypass_the_ceiling() {
+        let mut usage = subscription_usage();
+        let additional = json!({
+            "limit_name": "GPT-5.3-Codex-Spark",
+            "metered_feature": "codex_spark",
+            "rate_limit": usage["rate_limit"].clone()
+        });
+        usage["additional_rate_limits"] = json!([additional]);
+        assert_eq!(subscription_windows(&usage, 90.0).unwrap().len(), 2);
+        usage["additional_rate_limits"][0]["rate_limit"]["primary_window"]["used_percent"] = 95.into();
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        usage["additional_rate_limits"][0]["rate_limit"] = Value::Null;
+        assert!(subscription_windows(&usage, 90.0).is_err());
+        usage["additional_rate_limits"] = json!({ "unexpected": true });
+        assert!(subscription_windows(&usage, 90.0).is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_guard_rejects_api_keys_without_a_network_request() {
+        let app = App::new(
+            crate::config::Config {
+                auth_dir: "/nonexistent".into(),
+                codex_subscription_only: true,
+                ..Default::default()
+            },
+            "unused.yaml".into(),
+        );
+        let acct = Arc::new(account(Credential::ApiKey { key: "synthetic-key".into(), base_url: None }));
+        let error = require_subscription(&app, &acct, "gpt-6.1-sol").await.unwrap_err();
+        assert!(error.to_string().contains("API keys"));
+    }
+
+    #[test]
+    fn subscription_credentials_require_an_official_oauth_account() {
+        let oauth = crate::accounts::OAuth {
+            access_token: "synthetic-token".into(),
+            account_id: Some("synthetic-account".into()),
+            ..Default::default()
+        };
+        assert!(subscription_credentials(&account(Credential::OAuth(oauth.clone()))).is_ok());
+        let custom = crate::accounts::OAuth { base_url: Some("https://example.com".into()), ..oauth.clone() };
+        assert!(subscription_credentials(&account(Credential::OAuth(custom))).is_err());
+        let mut other = account(Credential::OAuth(oauth.clone()));
+        other.provider = Provider::Claude;
+        assert!(subscription_credentials(&other).is_err());
+        let no_account = crate::accounts::OAuth { account_id: None, ..oauth };
+        assert!(subscription_credentials(&account(Credential::OAuth(no_account))).is_err());
+    }
+
+    #[tokio::test]
+    async fn subscription_guard_is_inactive_by_default() {
+        let app = App::new(
+            crate::config::Config { auth_dir: "/nonexistent".into(), ..Default::default() },
+            "unused.yaml".into(),
+        );
+        let acct = Arc::new(account(Credential::ApiKey { key: "synthetic-key".into(), base_url: None }));
+        assert!(require_subscription(&app, &acct, "gpt-6.1-sol").await.is_ok());
+    }
 
     #[test]
     fn usage_endpoints_parse() {

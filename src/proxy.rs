@@ -374,6 +374,12 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             continue;
         }
 
+        if let Err(e) = crate::quota::require_subscription(&app, &acct, &model).await {
+            let msg = format!("subscription-only request refused: {e}");
+            tracker.finish(429, &Usage::default(), Some(msg.clone()));
+            return error_reply(call.format, 429, &msg);
+        }
+
         let provider = acct.provider;
         let devin = provider == Provider::Devin;
         // Freeform (custom) tools only exist on OpenAI's own Responses backends.
