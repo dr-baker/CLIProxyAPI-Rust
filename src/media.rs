@@ -391,6 +391,7 @@ where
         }
         match op(acct.clone(), upstream_model).await {
             Ok(v) => {
+                tracker.audit("upstream_response", "http", v.clone());
                 acct.record_ok();
                 let usage = Usage {
                     input: v["usage"]["input_tokens"].as_u64().unwrap_or(0),

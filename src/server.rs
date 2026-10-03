@@ -103,7 +103,8 @@ async fn run(app: Arc<App>, format: Format, headers: HeaderMap, body: Bytes) -> 
         Err(r) => return *r,
     };
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let call = Call { format, body, headers, stream, transport: "http", path_model: None, pinned: None };
+    let call =
+        Call { request_id: None, format, body, headers, stream, transport: "http", path_model: None, pinned: None };
     reply(format, proxy::execute(app, call).await, false)
 }
 
@@ -211,8 +212,16 @@ async fn completions(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         }
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    let call =
-        Call { format: Format::Chat, body: chat, headers, stream, transport: "http", path_model: None, pinned: None };
+    let call = Call {
+        request_id: None,
+        format: Format::Chat,
+        body: chat,
+        headers,
+        stream,
+        transport: "http",
+        path_model: None,
+        pinned: None,
+    };
     match proxy::execute(app, call).await {
         Reply::Json(v) => {
             let choice = &v["choices"][0];
@@ -294,6 +303,7 @@ async fn gemini(
     };
     let json_array = stream && q.get("alt").map(String::as_str) != Some("sse");
     let call = Call {
+        request_id: None,
         format: Format::Gemini,
         body,
         headers,

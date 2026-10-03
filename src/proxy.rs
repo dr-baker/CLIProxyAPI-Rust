@@ -20,6 +20,7 @@ use crate::upstream::{self, Target};
 pub type FrameStream = Pin<Box<dyn Stream<Item = Frame> + Send>>;
 
 pub struct Call {
+    pub request_id: Option<u64>,
     pub format: Format,
     pub body: Value,
     pub headers: HeaderMap,
@@ -50,6 +51,17 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn new(app: &Arc<App>, client: Format, stream: bool, transport: &'static str, model: &str) -> Self {
+        Self::new_with_id(app, client, stream, transport, model, app.stats.next_id())
+    }
+
+    pub fn new_with_id(
+        app: &Arc<App>,
+        client: Format,
+        stream: bool,
+        transport: &'static str,
+        model: &str,
+        request_id: u64,
+    ) -> Self {
         app.stats.active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             app: app.clone(),
@@ -57,7 +69,7 @@ impl Tracker {
             acct: None,
             done: false,
             log: RequestLog {
-                id: app.stats.next_id(),
+                id: request_id,
                 ts: Utc::now(),
                 client: client.as_str(),
                 provider: String::new(),
@@ -82,6 +94,16 @@ impl Tracker {
         self.log.provider = acct.provider.as_str().to_string();
         self.log.account = acct.label.clone();
         self.acct = Some(acct.clone());
+    }
+
+    pub fn id(&self) -> u64 {
+        self.log.id
+    }
+
+    pub fn audit(&self, direction: &str, transport: &str, data: Value) {
+        if let Err(e) = self.app.audit.record(self.id(), direction, transport, data) {
+            tracing::error!("local request archive write failed: {e}");
+        }
     }
 
     /// Drops the tracker without recording a request.
@@ -123,6 +145,7 @@ impl Tracker {
             st.last_used = Some(Utc::now());
         }
         self.app.stats.record(&self.log);
+        self.audit("summary", self.log.transport, serde_json::to_value(&self.log).unwrap_or_default());
         self.app.broadcast("request", &self.log);
         tracing::info!(
             target: "cliproxyapi_rust::request",
@@ -335,7 +358,15 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
     let (model, suffix) = ir::split_model_suffix(&raw_model);
     let (only, model) = app.pool.route(&model);
     let model = app.pool.canonical(&model, only.as_ref());
-    let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
+    let mut tracker = Tracker::new_with_id(
+        &app,
+        call.format,
+        call.stream,
+        call.transport,
+        &model,
+        call.request_id.unwrap_or_else(|| app.stats.next_id()),
+    );
+    tracker.audit("downstream_request", call.transport, call.body.clone());
 
     let mut parsed: Option<Request> = None;
     let mut tried: Vec<String> = Vec::new();
@@ -453,6 +484,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
             tracing::debug!(url = %prepared.url, body = %prepared.body, "upstream request");
         }
 
+        tracker.audit("upstream_request", "http", prepared.body.clone());
         let client = app.http.for_account(&acct);
         let mut rb = client.post(&prepared.url);
         for (k, v) in &prepared.headers {
@@ -748,6 +780,7 @@ fn passthrough_stream(resp: reqwest::Response, native: Format, mut tracker: Trac
                 } else {
                     sse.data
                 };
+                tracker.audit("upstream_event", "http", serde_json::from_str(&data).unwrap_or_else(|_| Value::String(data.clone())));
                 yield Frame { event: sse.event.map(std::borrow::Cow::Owned), data };
             }
             if end {
@@ -771,6 +804,11 @@ async fn collect_passthrough(mut body: ByteStream, native: Format, mut tracker: 
     let mut final_obj: Option<Value> = None;
     let mut evs = Vec::new();
     let mut handle = |sse: crate::sse::SseEvent, agg: &mut Aggregate, final_obj: &mut Option<Value>| {
+        tracker.audit(
+            "upstream_event",
+            "http",
+            serde_json::from_str(&sse.data).unwrap_or_else(|_| Value::String(sse.data.clone())),
+        );
         parser.feed(&sse, &mut evs);
         evs.drain(..).for_each(|e| agg.push(&e));
         if let Ok(v) = serde_json::from_str::<Value>(&sse.data)

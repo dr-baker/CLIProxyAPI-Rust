@@ -20,6 +20,7 @@ pub struct App {
     pub pool: Pool,
     pub http: Http,
     pub stats: Stats,
+    pub audit: crate::audit::Audit,
     pub logins: Mutex<HashMap<String, crate::mgmt::Login>>,
     pub started: DateTime<Utc>,
     pub live: broadcast::Sender<String>,
@@ -33,6 +34,7 @@ impl App {
         pool.reload(&cfg);
         let (live, _) = broadcast::channel(512);
         Arc::new(Self {
+            audit: crate::audit::Audit::new(&cfg),
             http: Http::new(&cfg.proxy_url),
             cfg: ArcSwap::from_pointee(cfg),
             cfg_path,
@@ -50,6 +52,7 @@ impl App {
     }
 
     pub fn set_config(&self, cfg: Config) {
+        self.audit.configure(&cfg);
         self.http.set_default_proxy(&cfg.proxy_url);
         self.pool.reload(&cfg);
         self.cfg.store(Arc::new(cfg));

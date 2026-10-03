@@ -1,5 +1,6 @@
 mod accounts;
 mod antigravity;
+mod audit;
 mod compat;
 mod config;
 mod device;

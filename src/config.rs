@@ -35,6 +35,9 @@ pub struct Config {
     pub codex_subscription_only: bool,
     /// Stop admitting requests when any subscription window reaches this percentage.
     pub subscription_usage_ceiling_percent: f64,
+    /// Save local request and response logs.
+    pub request_log: bool,
+    pub request_log_dir: String,
     /// Rewrite non-Claude-Code requests on Claude OAuth accounts so they look like Claude Code.
     pub claude_cloak: bool,
     pub debug: bool,
@@ -197,6 +200,8 @@ impl Default for Config {
             codex_websockets: true,
             codex_subscription_only: false,
             subscription_usage_ceiling_percent: 90.0,
+            request_log: false,
+            request_log_dir: "~/.cli-proxy-api/logs".into(),
             claude_cloak: true,
             debug: false,
             tls: Tls::default(),
@@ -234,6 +239,8 @@ routing: least-used         # least-used (most quota left) | round-robin | fill-
 codex-websockets: true      # native upstream websocket for Codex websocket clients
 codex-subscription-only: false # OAuth only; check subscription allowance before every request
 subscription-usage-ceiling-percent: 90.0
+request-log: false          # save local request and response logs
+request-log-dir: "~/.cli-proxy-api/logs"
 claude-cloak: true          # make non-Claude-Code clients look like Claude Code on OAuth accounts
 debug: false
 
@@ -336,20 +343,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_settings_default_to_off() {
+    fn subscription_and_log_settings_default_to_off() {
         let cfg = Config::parse("").unwrap();
         assert!(!cfg.codex_subscription_only);
         assert_eq!(cfg.subscription_usage_ceiling_percent, 90.0);
+        assert!(!cfg.request_log);
+        assert_eq!(cfg.request_log_dir, "~/.cli-proxy-api/logs");
     }
 
     #[test]
-    fn subscription_settings_parse() {
+    fn subscription_and_log_settings_parse() {
         let cfg = Config::parse(
-            "codex-subscription-only: true\nsubscription-usage-ceiling-percent: 85\n",
+            "codex-subscription-only: true\nsubscription-usage-ceiling-percent: 85\nrequest-log: true\nrequest-log-dir: /tmp/logs\n",
         )
         .unwrap();
-        assert!(cfg.codex_subscription_only);
+        assert!(cfg.codex_subscription_only && cfg.request_log);
         assert_eq!(cfg.subscription_usage_ceiling_percent, 85.0);
+        assert_eq!(cfg.request_log_dir, "/tmp/logs");
         for value in ["0", "-1", "101", ".nan", ".inf"] {
             assert!(Config::parse(&format!("subscription-usage-ceiling-percent: {value}")).is_err());
         }

@@ -151,6 +151,7 @@ async fn turn(
         transport: "ws",
         path_model: None,
         pinned: sess.pinned.clone(),
+        request_id: None,
     };
     match proxy::execute(app.clone(), call).await {
         Reply::Stream { mut frames, .. } => {
