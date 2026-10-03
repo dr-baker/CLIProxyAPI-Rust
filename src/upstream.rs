@@ -318,7 +318,6 @@ const CODEX_STRIP: &[&str] = &[
     "top_p",
     "safety_identifier",
     "prompt_cache_retention",
-    "generate",
     "user",
     "truncation",
     "stream_options",
@@ -344,6 +343,9 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, keep_previous: bool) {
         }
         if !keep_previous {
             o.remove("previous_response_id");
+            // HTTP does not support warmups. The websocket handler prevents a
+            // generate=false request from reaching this HTTP path.
+            o.remove("generate");
         }
         if let Some(Value::Array(items)) = o.get_mut("input") {
             // Reasoning tunnelled from another provider can't be decrypted by OpenAI.
@@ -381,8 +383,8 @@ pub fn codex_headers(client: &HeaderMap, token: &str, account_id: Option<&str>, 
         }
     }
     if oauth {
-        h.push(("user-agent".into(), CODEX_USER_AGENT.into()));
-        h.push(("originator".into(), CODEX_ORIGINATOR.into()));
+        h.push(("user-agent".into(), header(client, "user-agent").unwrap_or_else(|| CODEX_USER_AGENT.into())));
+        h.push(("originator".into(), header(client, "originator").unwrap_or_else(|| CODEX_ORIGINATOR.into())));
         if let Some(a) = account_id {
             h.push(("chatgpt-account-id".into(), a.into()));
         }
@@ -413,12 +415,15 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
     Prepared { url: format!("{base}/responses"), headers, body, raw: None }
 }
 
-pub fn codex_ws_url(acct: &Account) -> (String, Vec<(String, String)>) {
+pub fn codex_ws_url(acct: &Account, client: &HeaderMap) -> (String, Vec<(String, String)>) {
     let (token, base, oauth, account_id) = creds(acct);
     let base = base.unwrap_or_else(|| if oauth { CODEX_BACKEND.into() } else { OPENAI_API.into() });
     let ws = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-    let mut h = codex_headers(&HeaderMap::new(), &token, account_id.as_deref(), oauth);
-    h.push(("openai-beta".into(), CODEX_WS_BETA.into()));
+    let mut h = codex_headers(client, &token, account_id.as_deref(), oauth);
+    let beta = header(client, "openai-beta")
+        .filter(|v| v.contains("responses_websockets="))
+        .unwrap_or_else(|| CODEX_WS_BETA.into());
+    h.push(("openai-beta".into(), beta));
     (format!("{ws}/responses"), h)
 }
 
@@ -657,6 +662,69 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "hi");
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn native_codex_warmup_preserves_generation_and_continuation_fields() {
+        let mut body = json!({
+            "generate": false, "previous_response_id": "resp_warmup",
+            "reasoning": { "effort": "max" }, "input": []
+        });
+        sanitize_codex_body(&mut body, "gpt-6.1-sol", true);
+        assert_eq!(body["generate"], false);
+        assert_eq!(body["previous_response_id"], "resp_warmup");
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["model"], "gpt-6.1-sol");
+
+        sanitize_codex_body(&mut body, "gpt-6.1-sol", false);
+        assert!(body.get("generate").is_none());
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn codex_websocket_headers_keep_client_session_but_replace_client_auth() {
+        let cfg = Config {
+            auth_dir: std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()).display().to_string(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "upstream-test-key".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all().pop().unwrap();
+        *acct.cred.write() = Credential::OAuth(crate::accounts::OAuth {
+            access_token: "upstream-test-key".into(),
+            account_id: Some("selected-account".into()),
+            ..Default::default()
+        });
+        let mut client = HeaderMap::new();
+        for (name, value) in [
+            ("authorization", "Bearer downstream-test-key"),
+            ("chatgpt-account-id", "downstream-account"),
+            ("user-agent", "codex-desktop/test-version"),
+            ("originator", "codex-desktop-test"),
+            ("session_id", "session-test"),
+            ("thread-id", "thread-test"),
+            ("x-codex-turn-state", "turn-test"),
+            ("openai-beta", "responses_websockets=2026-02-06,other-feature=test"),
+        ] {
+            client.insert(axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+        }
+        let (url, headers) = codex_ws_url(&acct, &client);
+        let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, value)| value.as_str());
+        assert_eq!(url, "wss://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(header("authorization"), Some("Bearer upstream-test-key"));
+        assert_eq!(header("chatgpt-account-id"), Some("selected-account"));
+        assert_eq!(header("user-agent"), Some("codex-desktop/test-version"));
+        assert_eq!(header("originator"), Some("codex-desktop-test"));
+        assert_eq!(header("session_id"), Some("session-test"));
+        assert_eq!(header("thread-id"), Some("thread-test"));
+        assert_eq!(header("x-codex-turn-state"), Some("turn-test"));
+        assert_eq!(header("openai-beta"), Some("responses_websockets=2026-02-06,other-feature=test"));
+
+        let (_, headers) = codex_ws_url(&acct, &HeaderMap::new());
+        let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, value)| value.as_str());
+        assert_eq!(header("user-agent"), Some(CODEX_USER_AGENT));
+        assert_eq!(header("originator"), Some(CODEX_ORIGINATOR));
     }
 
     #[test]
