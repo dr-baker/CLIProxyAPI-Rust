@@ -315,7 +315,21 @@ async fn gemini(
     reply(Format::Gemini, proxy::execute(app, call).await, json_array)
 }
 
-async fn models(State(app): State<Arc<App>>) -> Response {
+async fn models(
+    State(app): State<Arc<App>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if query.contains_key("client_version") {
+        return match codex_model_catalog(&app, &headers, &query).await {
+            Ok(response) => response,
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({ "error": { "message": format!("Codex model catalog unavailable: {error}") } })),
+            )
+                .into_response(),
+        };
+    }
     let created = app.started.timestamp();
     let data: Vec<Value> = app
         .pool
@@ -332,6 +346,51 @@ async fn models(State(app): State<Arc<App>>) -> Response {
     let last = data.last().and_then(|m| m["id"].as_str()).map(String::from);
     axum::Json(json!({ "object": "list", "data": data, "has_more": false, "first_id": first, "last_id": last }))
         .into_response()
+}
+
+async fn codex_model_catalog(
+    app: &Arc<App>,
+    headers: &HeaderMap,
+    query: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Response> {
+    let version = query.get("client_version").ok_or_else(|| anyhow::anyhow!("missing client_version"))?;
+    anyhow::ensure!(!version.is_empty() && version.len() <= 128, "invalid client_version");
+    let acct = app
+        .pool
+        .all()
+        .into_iter()
+        .find(|acct| acct.is_codex_subscription() && !acct.state.lock().disabled)
+        .ok_or_else(|| anyhow::anyhow!("no official Codex OAuth account is available"))?;
+    crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await?;
+    let (token, account_id) = match &*acct.cred.read() {
+        crate::accounts::Credential::OAuth(oauth) => (oauth.access_token.clone(), oauth.account_id.clone()),
+        _ => anyhow::bail!("Codex model catalog requires OAuth"),
+    };
+    let mut request = app
+        .http
+        .for_account(&acct)
+        .get(format!("{}/models", crate::upstream::CODEX_BACKEND))
+        .query(query)
+        .timeout(Duration::from_secs(20));
+    for (name, value) in crate::upstream::codex_headers(headers, &token, account_id.as_deref(), true) {
+        request = request.header(name, value);
+    }
+    if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
+        request = request.header(header::IF_NONE_MATCH, etag);
+    }
+    let response = request.send().await?.error_for_status()?;
+    let etag = response.headers().get(header::ETAG).cloned();
+    let mut result = if response.status() == StatusCode::NOT_MODIFIED {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let catalog: Value = response.json().await?;
+        anyhow::ensure!(catalog["models"].is_array(), "upstream did not return a Codex model catalog");
+        axum::Json(catalog).into_response()
+    };
+    if let Some(etag) = etag {
+        result.headers_mut().insert(header::ETAG, etag);
+    }
+    Ok(result)
 }
 
 async fn gemini_models(State(app): State<Arc<App>>) -> Response {
