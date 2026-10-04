@@ -394,15 +394,13 @@ impl StreamParser for Parser {
         let kind = v["type"].as_str().or(ev.event.as_deref()).unwrap_or_default();
         let idx = v["output_index"].as_u64().unwrap_or(0) as usize;
         match kind {
-            "response.created" | "response.in_progress" => {
-                if !self.started {
-                    self.started = true;
-                    let r = &v["response"];
-                    out.push(Event::Start {
-                        id: r["id"].as_str().map(String::from),
-                        model: r["model"].as_str().map(String::from),
-                    });
-                }
+            "response.created" | "response.in_progress" if !self.started => {
+                self.started = true;
+                let r = &v["response"];
+                out.push(Event::Start {
+                    id: r["id"].as_str().map(String::from),
+                    model: r["model"].as_str().map(String::from),
+                });
             }
             "response.output_item.added" => {
                 let item = &v["item"];

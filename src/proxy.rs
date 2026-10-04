@@ -416,7 +416,7 @@ pub async fn execute(app: Arc<App>, call: Call) -> Reply {
         // Freeform (custom) tools only exist on OpenAI's own Responses backends.
         let custom_tools = call.format == Format::Responses
             && call.body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "custom"));
-        let passthrough = provider.wires().contains(&call.format) && !(custom_tools && !native_custom_tools(provider));
+        let passthrough = provider.wires().contains(&call.format) && (!custom_tools || native_custom_tools(provider));
         let native = if passthrough { call.format } else { provider.wires().first().copied().unwrap_or(Format::Chat) };
         let mut names = HashMap::new();
         let body = if passthrough {

@@ -641,10 +641,8 @@ impl StreamRenderer for Renderer {
                     out,
                 );
             }
-            Event::ToolArgs { key, delta } => {
-                if self.block == Block::Tool(*key) {
-                    self.delta(json!({ "type": "input_json_delta", "partial_json": delta }), out);
-                }
+            Event::ToolArgs { key, delta } if self.block == Block::Tool(*key) => {
+                self.delta(json!({ "type": "input_json_delta", "partial_json": delta }), out);
             }
             Event::Image { mime, data } => {
                 // Assistant turns can't carry image blocks; inline it as a markdown data URL.
