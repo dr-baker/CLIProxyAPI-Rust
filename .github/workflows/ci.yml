@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, verify-idle-websocket-ci-5a1c143]
   pull_request:
 
 env:
