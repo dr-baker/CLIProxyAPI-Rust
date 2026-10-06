@@ -1,0 +1,44 @@
+{
+  "date_pacific": "2026-10-06",
+  "method": "Synthetic JSON payload, 32 archive records, 8 jobs, 2 Tokio request workers, 10ms heartbeat. The same Audit::record implementation was compared on request workers and spawn_blocking workers. Mode order alternated. Temp directories only; no credentials, upstream or production archive.",
+  "on_request_workers": [
+    {
+      "elapsed_ms": 2423.974375,
+      "max_heartbeat_delay_ms": 2311.041584
+    },
+    {
+      "elapsed_ms": 2055.857375,
+      "max_heartbeat_delay_ms": 1966.105125
+    },
+    {
+      "elapsed_ms": 2188.9205,
+      "max_heartbeat_delay_ms": 2098.948083
+    }
+  ],
+  "offloaded": [
+    {
+      "elapsed_ms": 2304.954458,
+      "max_heartbeat_delay_ms": 2.446084
+    },
+    {
+      "elapsed_ms": 2274.510208,
+      "max_heartbeat_delay_ms": 2.41875
+    },
+    {
+      "elapsed_ms": 2302.340375,
+      "max_heartbeat_delay_ms": 2.432875
+    }
+  ],
+  "serializer_write_calls": {
+    "payload_bytes": 94901,
+    "direct": 42007,
+    "buffered_64k": 2
+  },
+  "conclusion": "Synchronous archive I/O can starve request workers for seconds. Offloading removes the scheduler stall in this controlled workload, while total write duration remains similar. Buffering reduces write-call amplification.",
+  "limitations": [
+    "Not a measurement of production disconnect causation or frequency.",
+    "Production binary has no function symbols, limiting attribution of sampled live stacks.",
+    "A production writer needs bounded count/byte queues, observable overflow and write failures, ordered shutdown and explicit durability behavior. Naively spawning a blocking task per event creates an unbounded backlog."
+  ],
+  "running_proxy_changed": false
+}

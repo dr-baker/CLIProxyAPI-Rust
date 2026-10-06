@@ -65,6 +65,10 @@ impl Audit {
 }
 
 #[cfg(test)]
+#[path = "audit/diagnostic_benchmark.rs"]
+mod diagnostic_benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
