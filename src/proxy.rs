@@ -85,6 +85,7 @@ impl Tracker {
                 transport,
                 attempts: 0,
                 error: None,
+                termination_reason: None,
             },
         }
     }
@@ -120,6 +121,15 @@ impl Tracker {
         }
     }
 
+    /// Record a failed downstream send separately from an unexplained tracker drop.
+    pub fn downstream_write_failed(&mut self, usage: &Usage) {
+        if self.done {
+            return;
+        }
+        self.log.termination_reason = Some(crate::state::TerminationReason::DownstreamWriteFailed);
+        self.finish(499, usage, Some("downstream write failed".into()));
+    }
+
     pub fn finish(&mut self, status: u16, usage: &Usage, error: Option<String>) {
         if self.done {
             return;
@@ -128,6 +138,9 @@ impl Tracker {
         self.app.stats.active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         let (input, output, cache) = crate::state::usage_tokens(usage);
         self.log.status = status;
+        if status == 499 && self.log.termination_reason.is_none() {
+            self.log.termination_reason = Some(crate::state::TerminationReason::Unfinished);
+        }
         self.log.latency_ms = self.started.elapsed().as_millis() as u64;
         self.log.input_tokens = input;
         self.log.output_tokens = output;
@@ -159,7 +172,7 @@ impl Tracker {
 impl Drop for Tracker {
     fn drop(&mut self) {
         if !self.done {
-            self.finish(499, &Usage::default(), Some("client disconnected".into()));
+            self.finish(499, &Usage::default(), Some("request unfinished; cause unknown".into()));
         }
     }
 }
@@ -896,6 +909,43 @@ pub fn estimate_tokens(body: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep confirmed downstream failures, unexplained drops, and HTTP errors distinct.
+    #[test]
+    fn interruptions_are_distinct_from_errors_and_finished_once() {
+        let dir = std::env::temp_dir().join(format!("cliproxy-outcomes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() };
+        let app = App::new(cfg, dir.join("config.yaml"));
+        let mut ok = Tracker::new(&app, Format::Responses, true, "http", "test");
+        ok.finish(200, &Usage::default(), None);
+        ok.downstream_write_failed(&Usage::default());
+        let mut error = Tracker::new(&app, Format::Responses, true, "http", "test");
+        error.finish(502, &Usage::default(), Some("upstream closed".into()));
+        let mut downstream = Tracker::new(&app, Format::Responses, true, "upstream_ws", "test");
+        downstream.downstream_write_failed(&Usage::default());
+        drop(Tracker::new(&app, Format::Responses, true, "http", "test"));
+        let mut fallback = Tracker::new(&app, Format::Responses, true, "upstream_ws", "test");
+        fallback.cancel();
+        drop(fallback);
+        let totals = app.stats.totals.lock();
+        assert_eq!((totals.requests, totals.ok, totals.failed, totals.interrupted), (4, 1, 1, 2));
+        assert_eq!((totals.downstream_write_failed, totals.unfinished), (1, 1));
+        assert_eq!(app.stats.active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let rows = app.stats.recent.lock();
+        assert_eq!(rows[0].termination_reason, None);
+        assert_eq!(rows[1].termination_reason, None);
+        assert_eq!(serde_json::to_value(&rows[2]).unwrap()["termination_reason"], "downstream_write_failed");
+        assert_eq!(serde_json::to_value(&rows[3]).unwrap()["termination_reason"], "unfinished");
+        assert_eq!(rows[3].error.as_deref(), Some("request unfinished; cause unknown"));
+        let series = app.stats.series.lock();
+        let bucket = series.back().unwrap();
+        assert_eq!(
+            (bucket.failed, bucket.interrupted, bucket.downstream_write_failed, bucket.unfinished),
+            (1, 2, 1, 1)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn soft_failures_retry_and_quota_does_not() {

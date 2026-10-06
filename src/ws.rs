@@ -826,7 +826,7 @@ async fn native_turn(
         terminal = matches!(kind.as_str(), "response.completed" | "response.incomplete" | "response.failed" | "error");
         forwarded = true;
         if send(app, tracker.id(), tx, text).await.is_err() {
-            tracker.finish(499, &usage, Some("client disconnected".into()));
+            tracker.downstream_write_failed(&usage);
             return Native::Gone;
         }
         if terminal {

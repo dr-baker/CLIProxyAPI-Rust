@@ -146,6 +146,14 @@ impl Http {
 
 // ----------------------------------------------------------------------- stats
 
+/// Why a request ended without a completed response; this does not establish client intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    DownstreamWriteFailed,
+    Unfinished,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestLog {
     pub id: u64,
@@ -164,6 +172,7 @@ pub struct RequestLog {
     pub transport: &'static str,
     pub attempts: u32,
     pub error: Option<String>,
+    pub termination_reason: Option<TerminationReason>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -171,6 +180,9 @@ pub struct Totals {
     pub requests: u64,
     pub ok: u64,
     pub failed: u64,
+    pub interrupted: u64,
+    pub downstream_write_failed: u64,
+    pub unfinished: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
@@ -181,6 +193,9 @@ pub struct Bucket {
     pub minute: i64,
     pub requests: u64,
     pub failed: u64,
+    pub interrupted: u64,
+    pub downstream_write_failed: u64,
+    pub unfinished: u64,
     pub tokens: u64,
 }
 
@@ -203,11 +218,18 @@ impl Stats {
 
     pub fn record(&self, log: &RequestLog) {
         let ok = log.status < 400;
+        let interrupted = log.status == 499;
         {
             let mut t = self.totals.lock();
             t.requests += 1;
             if ok {
                 t.ok += 1
+            } else if interrupted {
+                t.interrupted += 1;
+                match log.termination_reason {
+                    Some(TerminationReason::DownstreamWriteFailed) => t.downstream_write_failed += 1,
+                    _ => t.unfinished += 1,
+                }
             } else {
                 t.failed += 1
             }
@@ -226,7 +248,13 @@ impl Stats {
             }
             let b = s.back_mut().unwrap();
             b.requests += 1;
-            if !ok {
+            if interrupted {
+                b.interrupted += 1;
+                match log.termination_reason {
+                    Some(TerminationReason::DownstreamWriteFailed) => b.downstream_write_failed += 1,
+                    _ => b.unfinished += 1,
+                }
+            } else if !ok {
                 b.failed += 1;
             }
             b.tokens += log.input_tokens + log.output_tokens + log.cache_tokens;
