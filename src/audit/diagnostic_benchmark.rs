@@ -47,10 +47,11 @@ fn buffered_json_preserves_bytes_and_reduces_write_calls() {
     );
 }
 
-async fn measure(offload: bool) -> Value {
+async fn measure(background: bool) -> Value {
     let dir = std::env::temp_dir().join(format!("cliproxy-heartbeat-{}", uuid::Uuid::new_v4()));
     let cfg = Config { request_log: true, request_log_dir: dir.to_string_lossy().into(), ..Default::default() };
     let audit = Arc::new(Audit::new(&cfg));
+    let legacy_lock = Arc::new(Mutex::new(()));
     let done = Arc::new(AtomicBool::new(false));
     let monitor_done = done.clone();
     let monitor = tokio::spawn(async move {
@@ -72,18 +73,28 @@ async fn measure(offload: bool) -> Value {
     for id in 0..8 {
         let audit = audit.clone();
         let body = body.clone();
+        let dir = dir.clone();
+        let legacy_lock = legacy_lock.clone();
         jobs.push(tokio::spawn(async move {
-            if offload {
-                tokio::task::spawn_blocking(move || {
-                    for _ in 0..4 {
-                        audit.record(id, "synthetic_payload", "benchmark", body.clone()).unwrap();
-                    }
-                })
-                .await
-                .unwrap();
-            } else {
-                for _ in 0..4 {
-                    audit.record(id, "synthetic_payload", "benchmark", body.clone()).unwrap();
+            for _ in 0..4 {
+                if background {
+                    assert_eq!(
+                        audit.record(id, "synthetic_payload", "benchmark", body.clone()).unwrap(),
+                        Admission::Queued
+                    );
+                } else {
+                    // Reproduce the installed implementation: synchronous, unbuffered,
+                    // serialized file writes on request workers.
+                    let _guard = legacy_lock.lock();
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let now = Utc::now();
+                    let path = dir.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
+                    let record = json!({"timestamp":now.to_rfc3339(), "process_id":std::process::id(),
+                        "request_id":id,"direction":"synthetic_payload","transport":"benchmark","data":body});
+                    let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+                    serde_json::to_writer(&mut file, &record).unwrap();
+                    file.write_all(b"\n").unwrap();
+                    file.flush().unwrap();
                 }
             }
         }));
@@ -91,14 +102,20 @@ async fn measure(offload: bool) -> Value {
     for job in jobs {
         job.await.unwrap();
     }
+    let drained = audit.clone();
+    tokio::task::spawn_blocking(move || drained.shutdown()).await.unwrap().unwrap();
+    assert_eq!(audit.stats().dropped_payloads, 0);
+    if background {
+        assert_eq!(audit.stats().written, 32);
+    }
     done.store(true, Ordering::Relaxed);
     let delay = monitor.await.unwrap();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     std::fs::remove_dir_all(dir).unwrap();
-    json!({"offload":offload,"records":32,"elapsed_ms":elapsed,"max_heartbeat_delay_ms":delay})
+    json!({"background_writer":background,"records":32,"elapsed_ms":elapsed,"max_heartbeat_delay_ms":delay})
 }
 
-/// Compare the installed archive code on request workers versus blocking workers.
+/// Compare the installed synchronous archive with the bounded background writer.
 /// Timing is observational, so this probe has no timing-based pass/fail threshold.
 #[test]
 #[ignore = "manual synthetic disk and scheduler benchmark"]

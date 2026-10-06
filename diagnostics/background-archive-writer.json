@@ -1,0 +1,39 @@
+{
+  "date_pacific": "2026-10-06",
+  "method": "Debug build; synthetic 94,901-byte JSON payloads; 32 records, 8 jobs, 2 Tokio workers, 10ms heartbeat. Alternating installed synchronous writer baseline and implemented bounded background writer. Temporary files only.",
+  "baseline": [
+    {
+      "elapsed_ms": 2325.979917,
+      "max_heartbeat_delay_ms": 2207.924
+    },
+    {
+      "elapsed_ms": 2302.319792,
+      "max_heartbeat_delay_ms": 2219.471834
+    },
+    {
+      "elapsed_ms": 2353.499875,
+      "max_heartbeat_delay_ms": 2248.304666
+    }
+  ],
+  "background_writer": [
+    {
+      "elapsed_ms": 108.130375,
+      "max_heartbeat_delay_ms": 79.256625
+    },
+    {
+      "elapsed_ms": 110.594667,
+      "max_heartbeat_delay_ms": 80.781375
+    },
+    {
+      "elapsed_ms": 105.771667,
+      "max_heartbeat_delay_ms": 58.109
+    }
+  ],
+  "written_per_run": 32,
+  "dropped_per_run": 0,
+  "limitations": [
+    "Synthetic scheduler comparison, not production disconnect causation or model TPS.",
+    "Debug build on one host; wall-clock results vary."
+  ],
+  "running_proxy_changed": false
+}

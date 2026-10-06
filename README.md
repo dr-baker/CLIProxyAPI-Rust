@@ -368,3 +368,13 @@ The dashboard lives in `ui/` and is embedded with `include_str!`, so rebuild aft
 <br>
 
 <div align="center"><sub>Inspired by <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a>. Created in <a href="https://t3.codes">T3 Code</a>.</sub></div>
+
+## Local archive writes
+
+The local request archive serializes and writes records on one dedicated thread. Request workers enqueue records without waiting for disk I/O. A 64 KiB buffer reduces small writes, and the writer preserves admission order.
+
+The queue allows 1,024 records and a conservative 64 MiB estimate of owned record memory, including the record being written. Payloads may use 960 records and 60 MiB; the remaining capacity is reserved for request summaries. Individual records above 16 MiB or nested deeper than 128 levels are dropped. If the queue fills, records are dropped rather than blocking request workers.
+
+The management overview exposes archive queue size, written records, dropped payloads, dropped summaries, and write errors. Live request totals remain independent of archive coverage. A queued record is not yet durable: the writer flushes each record and calls `sync_all` for summaries. Normal server shutdown drains accepted records and can wait for disk I/O. A crash can lose queued records; a partial write can leave an incomplete JSONL tail.
+
+Run the synthetic scheduler comparison with `cargo test --locked archive_scheduler_probe -- --ignored --nocapture`. Recorded debug-build results are in `diagnostics/background-archive-writer.json`; they measure scheduler delay under synthetic archive traffic, not model TPS.

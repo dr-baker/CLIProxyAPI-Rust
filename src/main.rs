@@ -142,19 +142,20 @@ async fn serve(app: Arc<App>) -> Result<()> {
     }
     println!();
 
-    let service = server::router(app).into_make_service_with_connect_info::<SocketAddr>();
-    if let Some(tls) = tls {
+    let service = server::router(app.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let result = if let Some(tls) = tls {
         let handle = axum_server::Handle::new();
         let stop = handle.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
             stop.graceful_shutdown(Some(Duration::from_secs(10)));
         });
-        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await?;
+        axum_server::from_tcp_rustls(listener.into_std()?, tls)?.handle(handle).serve(service).await
     } else {
-        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
-    }
-    Ok(())
+        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await
+    };
+    tokio::task::spawn_blocking(move || app.audit.shutdown()).await.context("joining archive drain")??;
+    result.context("serving proxy")
 }
 
 /// Ctrl-C, or SIGTERM from `docker stop` / systemd.

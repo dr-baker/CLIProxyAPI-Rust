@@ -390,6 +390,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "routing": cfg.routing,
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),
+        "archive": app.audit.stats(),
         "active": app.stats.active.load(Ordering::Relaxed),
         "series": app.stats.series(),
         "accounts": { "total": accounts.len(), "active": active, "cooling": cooling, "disabled": disabled, "providers": providers },

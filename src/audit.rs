@@ -1,22 +1,125 @@
-//! Local, append-only payload and timing archive. Authentication headers are never recorded.
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+//! Bounded, local payload archive. Serialization and disk I/O run on one writer thread.
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::Config;
 
+#[derive(Clone, Copy)]
+struct Limits {
+    records: usize,
+    payload_records: usize,
+    bytes: usize,
+    payload_bytes: usize,
+    record_bytes: usize,
+}
+
+const LIMITS: Limits =
+    Limits { records: 1024, payload_records: 960, bytes: 64 << 20, payload_bytes: 60 << 20, record_bytes: 16 << 20 };
+
+/// Local archive coverage and queue pressure, without payloads or account identifiers.
+#[derive(Default, Clone, Serialize)]
+pub struct ArchiveStats {
+    pub pending_records: usize,
+    pub pending_bytes: usize,
+    pub written: u64,
+    pub dropped_payloads: u64,
+    pub dropped_summaries: u64,
+    pub write_errors: u64,
+    pub last_error_kind: Option<String>,
+    pub last_os_error: Option<i32>,
+}
+
+struct Job {
+    path: PathBuf,
+    record: Value,
+    bytes: usize,
+    summary: bool,
+}
+
+struct Writer {
+    sender: Option<mpsc::SyncSender<Job>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Outcome of admission; queued records are not yet durable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    Disabled,
+    Queued,
+    Dropped,
+}
+
 pub struct Audit {
     directory: RwLock<Option<PathBuf>>,
-    writer: Mutex<()>,
+    writer: Mutex<Writer>,
+    stats: Arc<Mutex<ArchiveStats>>,
+    limits: Limits,
 }
 
 impl Audit {
     pub fn new(cfg: &Config) -> Self {
-        Self { directory: RwLock::new(Self::path(cfg)), writer: Mutex::new(()) }
+        let mut file = None;
+        Self::with_writer(cfg, LIMITS, move |job| write_job(job, &mut file))
+    }
+
+    fn with_writer(
+        cfg: &Config,
+        limits: Limits,
+        mut write: impl FnMut(&Job) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        let stats = Arc::new(Mutex::new(ArchiveStats::default()));
+        let worker_stats = stats.clone();
+        let (sender, receiver) = mpsc::sync_channel::<Job>(limits.records);
+        let handle = std::thread::Builder::new().name("proxy-archive".into()).spawn(move || {
+            let mut reported = (0, 0, 0);
+            for job in receiver {
+                let result = write(&job);
+                let bytes = job.bytes;
+                // Release the payload before releasing its memory reservation.
+                drop(job);
+                let snapshot = {
+                    let mut stats = worker_stats.lock();
+                    stats.pending_records -= 1;
+                    stats.pending_bytes -= bytes;
+                    match result {
+                        Ok(()) => stats.written += 1,
+                        Err(error) => {
+                            stats.write_errors += 1;
+                            stats.last_error_kind = Some(format!("{:?}", error.kind()));
+                            stats.last_os_error = error.raw_os_error();
+                        }
+                    }
+                    stats.clone()
+                };
+                // Formatting/output may block. Only the dedicated writer does it,
+                // after releasing shared locks; never report overflow on admission.
+                if needs_report(snapshot.dropped_payloads, reported.0)
+                    || needs_report(snapshot.dropped_summaries, reported.1)
+                    || needs_report(snapshot.write_errors, reported.2)
+                {
+                    reported = (snapshot.dropped_payloads, snapshot.dropped_summaries, snapshot.write_errors);
+                    tracing::warn!(dropped_payloads = reported.0, dropped_summaries = reported.1,
+                        write_errors = reported.2, error_kind = ?snapshot.last_error_kind,
+                        os_error = ?snapshot.last_os_error, "local archive coverage is incomplete");
+                }
+            }
+        });
+        let writer = match handle {
+            Ok(handle) => Writer { sender: Some(sender), handle: Some(handle) },
+            Err(_) => {
+                stats.lock().write_errors += 1;
+                Writer { sender: None, handle: None }
+            }
+        };
+        Self { directory: RwLock::new(Self::path(cfg)), writer: Mutex::new(writer), stats, limits }
     }
 
     fn path(cfg: &Config) -> Option<PathBuf> {
@@ -35,17 +138,127 @@ impl Audit {
         *self.directory.write() = Self::path(cfg);
     }
 
-    pub fn record(&self, request_id: u64, direction: &str, transport: &str, data: Value) -> io::Result<()> {
+    pub fn stats(&self) -> ArchiveStats {
+        self.stats.lock().clone()
+    }
+
+    /// Admit a record without waiting for disk I/O or queue capacity.
+    ///
+    /// Budget includes the record being written. Payloads leave reserved space for
+    /// summaries; overload and oversized records produce observable coverage loss.
+    pub fn record(&self, request_id: u64, direction: &str, transport: &str, data: Value) -> io::Result<Admission> {
         let Some(directory) = self.directory.read().clone() else {
-            return Ok(());
+            return Ok(Admission::Disabled);
         };
-        let _guard = self.writer.lock();
+        let summary = direction == "summary";
         let now = Utc::now();
+        let path = directory.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
         let record = json!({ "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             "process_id": std::process::id(), "request_id": request_id,
             "direction": direction, "transport": transport, "data": data });
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
+        let bytes = heap_budget(&record, 0, self.limits.record_bytes)
+            .and_then(|bytes| bytes.checked_add(path.as_os_str().len() + 256));
+        let writer = self.writer.lock();
+        let Some(sender) = &writer.sender else {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "archive writer is closed or unavailable"));
+        };
+        let mut stats = self.stats.lock();
+        let record_limit = if summary { self.limits.records } else { self.limits.payload_records };
+        let byte_limit = if summary { self.limits.bytes } else { self.limits.payload_bytes };
+        let Some(bytes) = bytes.filter(|bytes| {
+            *bytes <= self.limits.record_bytes
+                && stats.pending_records < record_limit
+                && stats.pending_bytes.saturating_add(*bytes) <= byte_limit
+        }) else {
+            note_drop(&mut stats, summary);
+            return Ok(Admission::Dropped);
+        };
+        stats.pending_records += 1;
+        stats.pending_bytes += bytes;
+        // The writer lock orders admissions; the budget lock prevents the worker
+        // releasing a reservation until try_send has either accepted or rolled back.
+        match sender.try_send(Job { path, record, bytes, summary }) {
+            Ok(()) => Ok(Admission::Queued),
+            Err(_) => {
+                stats.pending_records -= 1;
+                stats.pending_bytes -= bytes;
+                note_drop(&mut stats, summary);
+                Ok(Admission::Dropped)
+            }
+        }
+    }
+
+    /// Close admission and drain accepted records. Call off async request workers.
+    pub fn shutdown(&self) -> io::Result<()> {
+        let handle = {
+            let mut writer = self.writer.lock();
+            writer.sender.take();
+            writer.handle.take()
+        };
+        if let Some(handle) = handle {
+            handle.join().map_err(|_| io::Error::other("archive writer panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Audit {
+    fn drop(&mut self) {
+        // Dropping an App must never wait for disk I/O on a request worker.
+        // Serve explicitly drains before process exit; abandoned instances close admission.
+        self.writer.get_mut().sender.take();
+    }
+}
+
+fn note_drop(stats: &mut ArchiveStats, summary: bool) {
+    if summary {
+        stats.dropped_summaries += 1;
+    } else {
+        stats.dropped_payloads += 1;
+    }
+}
+
+fn needs_report(count: u64, previous: u64) -> bool {
+    count > 0 && (previous == 0 || count >= previous.saturating_mul(2))
+}
+
+/// Conservative owned-heap estimate, capped before serialization or queue admission.
+fn heap_budget(value: &Value, depth: usize, limit: usize) -> Option<usize> {
+    if depth > 128 {
+        return None;
+    }
+    let mut bytes = std::mem::size_of::<Value>();
+    match value {
+        Value::String(text) => bytes = bytes.checked_add(text.capacity())?,
+        Value::Array(values) => {
+            bytes = bytes.checked_add(values.capacity().checked_mul(std::mem::size_of::<Value>())?)?;
+            for value in values {
+                bytes = bytes.checked_add(heap_budget(value, depth + 1, limit.saturating_sub(bytes))?)?;
+                if bytes > limit {
+                    return None;
+                }
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                bytes = bytes.checked_add(128 + key.capacity())?;
+                bytes = bytes.checked_add(heap_budget(value, depth + 1, limit.saturating_sub(bytes))?)?;
+                if bytes > limit {
+                    return None;
+                }
+            }
+        }
+        _ => {}
+    }
+    (bytes <= limit).then_some(bytes)
+}
+
+fn write_job(job: &Job, current: &mut Option<(PathBuf, BufWriter<File>)>) -> io::Result<()> {
+    if current.as_ref().is_none_or(|(path, _)| path != &job.path) {
+        if let Some((_, file)) = current {
+            file.flush()?;
+        }
+        std::fs::create_dir_all(job.path.parent().unwrap())?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -53,47 +266,30 @@ impl Audit {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
-        serde_json::to_writer(&mut file, &record)?;
+        *current = Some((job.path.clone(), BufWriter::with_capacity(64 << 10, options.open(&job.path)?)));
+    }
+    let file = &mut current.as_mut().unwrap().1;
+    let result = (|| {
+        serde_json::to_writer(&mut *file, &job.record)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        if direction == "summary" {
-            file.sync_all()?;
+        if job.summary {
+            file.get_ref().sync_all()?;
         }
         Ok(())
+    })();
+    if result.is_err() {
+        // Do not retry buffered bytes from a failed record on the next event.
+        if let Some((_, file)) = current.take() {
+            let _ = file.into_parts();
+        }
     }
+    result
 }
 
 #[cfg(test)]
 #[path = "audit/diagnostic_benchmark.rs"]
 mod diagnostic_benchmark;
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn archive_appends_and_disabled_archive_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("cliproxy-audit-{}", uuid::Uuid::new_v4()));
-        let mut cfg = Config { request_log_dir: dir.to_string_lossy().into(), ..Default::default() };
-        let audit = Audit::new(&cfg);
-        audit.record(1, "upstream_event", "websocket", json!({"type":"response.completed"})).unwrap();
-        assert!(!dir.exists());
-        cfg.request_log = true;
-        audit.configure(&cfg);
-        for id in [1, 2] {
-            audit.record(id, "upstream_event", "websocket", json!({"type":"response.completed"})).unwrap();
-        }
-        let path = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let rows: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["request_id"], 2);
-        assert_eq!(rows[0]["transport"], "websocket");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
+#[path = "audit/tests.rs"]
+mod tests;
