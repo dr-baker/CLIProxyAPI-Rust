@@ -389,6 +389,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "client_keys": cfg.api_keys,
         "routing": cfg.routing,
         "codex_subscription_only": cfg.codex_subscription_only,
+        "codex_subscription_credits": cfg.codex_subscription_credits,
         "subscription_usage_ceiling_percent": cfg.subscription_usage_ceiling_percent,
         "management_key": !cfg.management_key.is_empty(),
         "totals": *app.stats.totals.lock(),

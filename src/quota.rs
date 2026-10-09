@@ -38,6 +38,9 @@ pub struct Quota {
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Windows ran out but the plan's built-in credits keep the account serving.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub on_credits: bool,
 }
 
 impl Quota {
@@ -58,6 +61,10 @@ impl Quota {
 
     /// A window that is used up, and when it resets.
     pub fn exhausted_until(&self, model: &str) -> Option<DateTime<Utc>> {
+        // Credits carry the account past full windows, so they are not cooldowns.
+        if self.on_credits {
+            return None;
+        }
         self.live(model).filter(|w| w.used >= 100.0).filter_map(|w| w.resets_at).max()
     }
 
@@ -74,6 +81,9 @@ impl Quota {
             .collect();
         self.windows = windows;
         self.windows.extend(scoped);
+        if self.windows.iter().all(|w| w.used < 100.0) {
+            self.on_credits = false;
+        }
         self.updated_at = Some(Utc::now());
         if plan.is_some() {
             self.plan = plan;
@@ -247,24 +257,54 @@ fn checked_subscription_limit(rl: &Value, name: &str, ceiling: f64, now: DateTim
     Ok(windows)
 }
 
-fn subscription_windows(v: &Value, ceiling: f64) -> Result<Vec<Window>> {
+/// The plan's built-in credits can carry requests once subscription windows run out.
+fn credits_available(v: &Value) -> bool {
+    let c = &v["credits"];
+    if c["has_credits"] != true {
+        return false;
+    }
+    if c["unlimited"] == true {
+        return true;
+    }
+    match &c["balance"] {
+        Value::Null => true,
+        Value::Number(n) => n.as_f64().unwrap_or_default() > 0.0,
+        Value::String(s) => s.trim().parse::<f64>().is_ok_and(|b| b > 0.0),
+        _ => false,
+    }
+}
+
+/// Returns the subscription windows and whether eligibility rests on plan
+/// credits. Windows alone authorize requests; with `credits` set, an exhausted
+/// or unreadable allowance falls back to the plan's credit balance, while plan
+/// and entitlement checks still apply.
+fn subscription_windows(v: &Value, ceiling: f64, credits: bool) -> Result<(Vec<Window>, bool)> {
     ensure!(ceiling.is_finite() && ceiling > 0.0 && ceiling <= 100.0, "invalid subscription usage ceiling");
     ensure!(
         matches!(v["plan_type"].as_str(), Some("plus" | "pro")),
         "subscription-only mode requires a ChatGPT Plus or Pro plan"
     );
+    ensure!(v["rate_limit"]["allowed"] == true, "subscription allowance is unavailable");
     let now = Utc::now();
-    let mut windows = checked_subscription_limit(&v["rate_limit"], "Codex", ceiling, now)?;
-    if let Some(additional) = v.get("additional_rate_limits").filter(|value| !value.is_null()) {
-        let limits = additional.as_array().context("invalid additional subscription limits")?;
-        for limit in limits {
-            // Without a verified model selector, an additional bucket applies conservatively to every model.
-            let name = limit["limit_name"].as_str().unwrap_or("additional Codex");
-            windows.extend(checked_subscription_limit(&limit["rate_limit"], name, ceiling, now)?);
+    let strict = (|| -> Result<Vec<Window>> {
+        let mut windows = checked_subscription_limit(&v["rate_limit"], "Codex", ceiling, now)?;
+        if let Some(additional) = v.get("additional_rate_limits").filter(|value| !value.is_null()) {
+            let limits = additional.as_array().context("invalid additional subscription limits")?;
+            for limit in limits {
+                // Without a verified model selector, an additional bucket applies conservatively to every model.
+                let name = limit["limit_name"].as_str().unwrap_or("additional Codex");
+                windows.extend(checked_subscription_limit(&limit["rate_limit"], name, ceiling, now)?);
+            }
         }
+        Ok(windows)
+    })();
+    match strict {
+        Err(e) if credits && credits_available(v) => {
+            tracing::debug!("{e:#}; serving on plan credits");
+            Ok((codex_windows(v), true))
+        }
+        other => other.map(|w| (w, false)),
     }
-    // Credits never establish eligibility. Only the subscription windows above authorize a request.
-    Ok(windows)
 }
 
 /// Checks official subscription allowance before each inference, including on reused sockets.
@@ -279,16 +319,29 @@ pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -
     ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
     let usage =
         codex_usage(app, acct, &token, Some(&account_id)).await.context("subscription allowance check failed")?;
-    let windows = subscription_windows(&usage, cfg.subscription_usage_ceiling_percent)
-        .with_context(|| format!("subscription allowance rejected for {model}"))?;
+    let checked =
+        subscription_windows(&usage, cfg.subscription_usage_ceiling_percent, cfg.codex_subscription_credits);
     let active = app.pool.get(&acct.id).context("subscription account is no longer configured")?;
     ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
     ensure!(
         subscription_credentials(acct)? == (token, account_id),
         "subscription credentials changed during the allowance check; retry the request"
     );
-    acct.state.lock().quota.set(windows, usage["plan_type"].as_str().map(String::from));
-    Ok(())
+    let plan = usage["plan_type"].as_str().map(String::from);
+    let mut st = acct.state.lock();
+    match checked {
+        Ok((windows, on_credits)) => {
+            st.quota.set(windows, plan);
+            st.quota.on_credits = on_credits;
+            Ok(())
+        }
+        Err(e) => {
+            // Record the reported windows so routing sees the exhaustion.
+            st.quota.set(codex_windows(&usage), plan);
+            st.quota.on_credits = false;
+            Err(e).context(format!("subscription allowance rejected for {model}"))
+        }
+    }
 }
 
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
@@ -298,7 +351,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
         _ => return Ok(()),
     };
     let http = app.http.client(acct.proxy_url.as_deref());
-    let (windows, plan) = match acct.provider {
+    let (windows, plan, on_credits) = match acct.provider {
         Provider::Claude => {
             let v: Value = http
                 .get(CLAUDE_USAGE)
@@ -311,15 +364,23 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            (claude_windows(&v), None)
+            (claude_windows(&v), None, false)
         }
         Provider::Codex => {
             let v = codex_usage(app, acct, &token, account_id.as_deref()).await?;
-            (codex_windows(&v), v["plan_type"].as_str().map(String::from))
+            let windows = codex_windows(&v);
+            let on_credits = app.cfg().codex_subscription_credits
+                && credits_available(&v["credits"])
+                && windows.iter().any(|w| w.used >= 100.0);
+            (windows, v["plan_type"].as_str().map(String::from), on_credits)
         }
         _ => return Ok(()),
     };
-    acct.state.lock().quota.set(windows, plan);
+    let mut st = acct.state.lock();
+    if !windows.is_empty() {
+        st.quota.set(windows, plan);
+        st.quota.on_credits = on_credits;
+    }
     Ok(())
 }
 
@@ -407,29 +468,29 @@ mod tests {
 
     #[test]
     fn subscription_requires_known_available_allowance() {
-        assert!(subscription_windows(&subscription_usage(), 90.0).is_ok());
+        assert!(subscription_windows(&subscription_usage(), 90.0, false).is_ok());
         let mut plus = subscription_usage();
         plus["plan_type"] = "plus".into();
-        assert!(subscription_windows(&plus, 90.0).is_ok());
+        assert!(subscription_windows(&plus, 90.0, false).is_ok());
         for value in [Value::Null, json!({}), json!({ "plan_type": "pro", "rate_limit": {} })] {
-            assert!(subscription_windows(&value, 90.0).is_err());
+            assert!(subscription_windows(&value, 90.0, false).is_err());
         }
         for plan in ["free", "team", "business", "enterprise", "edu", "go", "unknown", ""] {
             let mut usage = subscription_usage();
             usage["plan_type"] = plan.into();
-            assert!(subscription_windows(&usage, 90.0).is_err());
+            assert!(subscription_windows(&usage, 90.0, false).is_err());
         }
         for field in ["allowed", "limit_reached"] {
             let mut usage = subscription_usage();
             usage["rate_limit"].as_object_mut().unwrap().remove(field);
-            assert!(subscription_windows(&usage, 90.0).is_err());
+            assert!(subscription_windows(&usage, 90.0, false).is_err());
         }
         let mut usage = subscription_usage();
         usage["rate_limit"]["limit_reached"] = true.into();
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         usage["rate_limit"]["limit_reached"] = false.into();
         usage["rate_limit"]["allowed"] = false.into();
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
     }
 
     #[test]
@@ -437,34 +498,34 @@ mod tests {
         for (used, allowed) in [(90.0, true), (99.9, true), (100.0, false)] {
             let mut usage = subscription_usage();
             usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
-            assert_eq!(subscription_windows(&usage, 100.0).is_ok(), allowed);
+            assert_eq!(subscription_windows(&usage, 100.0, false).is_ok(), allowed);
         }
         for used in [90.0, 99.0, 100.0, -1.0, 101.0] {
             let mut usage = subscription_usage();
             usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
-            assert!(subscription_windows(&usage, 90.0).is_err());
+            assert!(subscription_windows(&usage, 90.0, false).is_err());
         }
         let mut usage = subscription_usage();
         usage["rate_limit"]["primary_window"]["used_percent"] = 89.9.into();
-        assert!(subscription_windows(&usage, 90.0).is_ok());
+        assert!(subscription_windows(&usage, 90.0, false).is_ok());
         usage["rate_limit"]["secondary_window"] = usage["rate_limit"]["primary_window"].clone();
         usage["rate_limit"]["secondary_window"]["used_percent"] = 90.into();
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         usage["rate_limit"]["secondary_window"] = Value::Null;
         for reset in [Value::Null, json!(0), json!(-1), json!("tomorrow"), json!(Utc::now().timestamp() - 1)] {
             let mut usage = subscription_usage();
             usage["rate_limit"]["primary_window"]["reset_at"] = reset;
-            assert!(subscription_windows(&usage, 90.0).is_err());
+            assert!(subscription_windows(&usage, 90.0, false).is_err());
         }
         for field in ["used_percent", "reset_at", "limit_window_seconds"] {
             let mut usage = subscription_usage();
             usage["rate_limit"]["primary_window"].as_object_mut().unwrap().remove(field);
-            assert!(subscription_windows(&usage, 90.0).is_err());
+            assert!(subscription_windows(&usage, 90.0, false).is_err());
         }
         usage["rate_limit"]["primary_window"] = Value::Null;
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         for ceiling in [0.0, -1.0, 101.0, f64::NAN, f64::INFINITY] {
-            assert!(subscription_windows(&subscription_usage(), ceiling).is_err());
+            assert!(subscription_windows(&subscription_usage(), ceiling, false).is_err());
         }
     }
 
@@ -472,11 +533,35 @@ mod tests {
     fn credits_never_replace_subscription_allowance() {
         let mut usage = subscription_usage();
         usage["credits"] = json!({ "has_credits": true, "unlimited": true, "balance": "1000" });
-        assert!(subscription_windows(&usage, 90.0).is_ok());
+        assert!(subscription_windows(&usage, 90.0, false).is_ok());
         usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         usage["rate_limit"] = Value::Null;
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
+    }
+
+    #[test]
+    fn credits_carry_requests_past_exhausted_windows() {
+        let mut usage = subscription_usage();
+        usage["rate_limit"]["limit_reached"] = true.into();
+        usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
+        usage["credits"] = json!({ "has_credits": true, "unlimited": false, "balance": "25.00" });
+        let (windows, on_credits) = subscription_windows(&usage, 90.0, true).unwrap();
+        assert!(on_credits && windows.iter().any(|w| w.used == 100.0));
+        // A window past the ceiling also draws credits when the flag is on.
+        usage["rate_limit"]["limit_reached"] = false.into();
+        assert!(subscription_windows(&usage, 90.0, true).unwrap().1);
+        // An explicit zero balance does not rescue the request; unlimited does.
+        usage["credits"]["balance"] = "0".into();
+        assert!(subscription_windows(&usage, 90.0, true).is_err());
+        usage["credits"]["unlimited"] = true.into();
+        assert!(subscription_windows(&usage, 90.0, true).unwrap().1);
+        // Credits never substitute for plan or feature entitlement.
+        usage["rate_limit"]["allowed"] = false.into();
+        assert!(subscription_windows(&usage, 90.0, true).is_err());
+        usage["rate_limit"]["allowed"] = true.into();
+        usage["plan_type"] = "team".into();
+        assert!(subscription_windows(&usage, 90.0, true).is_err());
     }
 
     #[test]
@@ -488,13 +573,13 @@ mod tests {
             "rate_limit": usage["rate_limit"].clone()
         });
         usage["additional_rate_limits"] = json!([additional]);
-        assert_eq!(subscription_windows(&usage, 90.0).unwrap().len(), 2);
+        assert_eq!(subscription_windows(&usage, 90.0, false).unwrap().0.len(), 2);
         usage["additional_rate_limits"][0]["rate_limit"]["primary_window"]["used_percent"] = 95.into();
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         usage["additional_rate_limits"][0]["rate_limit"] = Value::Null;
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
         usage["additional_rate_limits"] = json!({ "unexpected": true });
-        assert!(subscription_windows(&usage, 90.0).is_err());
+        assert!(subscription_windows(&usage, 90.0, false).is_err());
     }
 
     #[tokio::test]
