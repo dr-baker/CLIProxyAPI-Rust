@@ -2,7 +2,7 @@
 name = "cliproxyapi-rust"
 version = "0.3.2"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "One fast binary that turns your Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex accounts into OpenAI, Anthropic and Gemini compatible APIs."
 license = "Unlicense"
 repository = "https://github.com/dr-baker/CLIProxyAPI-Rust"
@@ -10,6 +10,10 @@ homepage = "https://github.com/dr-baker/CLIProxyAPI-Rust"
 keywords = ["llm", "proxy", "claude", "openai", "gemini"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 readme = "README.md"
+
+[workspace]
+members = ["crates/capture-lifecycle"]
+resolver = "3"
 
 [dependencies]
 anyhow = "1"
@@ -21,6 +25,7 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 bcrypt = "0.19"
 bytes = "1"
+capture-lifecycle = { path = "crates/capture-lifecycle" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"

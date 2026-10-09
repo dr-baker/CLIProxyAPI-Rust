@@ -332,6 +332,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "capture-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "cc"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -441,6 +454,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "bytes",
+ "capture-lifecycle",
  "chrono",
  "clap",
  "flate2",
@@ -2272,6 +2286,7 @@ checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
