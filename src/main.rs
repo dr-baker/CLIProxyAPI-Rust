@@ -66,12 +66,17 @@ enum Cmd {
     /// Show what the config and auth directory contain, without starting the server.
     /// Handy before switching from CLIProxyAPI.
     Check,
+    /// Validate a configuration file without starting services or reading accounts.
+    ValidateConfig,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // CLIProxyAPI's Go-style flags (-config, -claude-login, ...) work too.
     let cli = Cli::parse_from(compat::translate_args(std::env::args().collect()));
+    if matches!(cli.cmd, Some(Cmd::ValidateConfig)) {
+        return validate_config(&cli.config);
+    }
     if matches!(cli.cmd, Some(Cmd::Check)) {
         return check(&cli.config);
     }
@@ -88,6 +93,19 @@ async fn main() -> Result<()> {
         }
         _ => serve(app).await,
     }
+}
+
+fn validate_config(path: &Path) -> Result<()> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| anyhow::anyhow!("configuration cannot be read"))?;
+    let mut bytes = Vec::new();
+    file.take(2 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("configuration cannot be read"))?;
+    anyhow::ensure!(bytes.len() <= 2 * 1024 * 1024, "configuration exceeds size limit");
+    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+    Config::parse(text).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+    Ok(())
 }
 
 async fn serve(app: Arc<App>) -> Result<()> {
@@ -351,4 +369,28 @@ fn check(path: &Path) -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod validation_tests {
+    #[test]
+    fn validation_is_read_only_and_does_not_load_accounts() {
+        let root = std::env::temp_dir().join(format!("proxy-validation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("config.yaml");
+        let accounts = root.join("never-created");
+        let text = format!("auth-dir: {}\nsubscription-usage-ceiling-percent: 100\n", accounts.display());
+        std::fs::write(&path, &text).unwrap();
+        super::validate_config(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!accounts.exists());
+        std::fs::write(&path, "subscription-usage-ceiling-percent: 101\n").unwrap();
+        assert_eq!(super::validate_config(&path).unwrap_err().to_string(), "invalid configuration");
+        let missing = root.join("missing.yaml");
+        assert!(super::validate_config(&missing).is_err());
+        assert!(!missing.exists());
+        std::fs::write(&path, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
+        assert!(super::validate_config(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
