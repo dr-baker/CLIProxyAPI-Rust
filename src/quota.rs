@@ -284,7 +284,20 @@ fn subscription_windows(v: &Value, ceiling: f64, credits: bool) -> Result<(Vec<W
         matches!(v["plan_type"].as_str(), Some("plus" | "pro")),
         "subscription-only mode requires a ChatGPT Plus or Pro plan"
     );
-    ensure!(v["rate_limit"]["allowed"] == true, "subscription allowance is unavailable");
+    // `allowed` describes included allowance, not credit eligibility. The
+    // provider sets it false at exhaustion even when credits remain available.
+    let exhausted_allowance = v["rate_limit"]["allowed"] == false
+        && v["rate_limit"]["limit_reached"] == true
+        && ["primary_window", "secondary_window"].iter().any(|key| {
+            let w = &v["rate_limit"][*key];
+            w["used_percent"].as_f64() == Some(100.0)
+                && w["limit_window_seconds"].as_i64().is_some_and(|s| s > 0)
+                && w["reset_at"].as_i64().and_then(ts).is_some_and(|r| r > Utc::now())
+        });
+    ensure!(
+        v["rate_limit"]["allowed"] == true || (credits && exhausted_allowance && credits_available(v)),
+        "subscription allowance is unavailable"
+    );
     let now = Utc::now();
     let strict = (|| -> Result<Vec<Window>> {
         let mut windows = checked_subscription_limit(&v["rate_limit"], "Codex", ceiling, now)?;
@@ -349,6 +362,17 @@ pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -
     }
 }
 
+/// Invalidate policy-dependent routing state after a configuration edit.
+pub fn invalidate_policy_cache(accounts: Vec<Arc<Account>>) {
+    for acct in accounts {
+        if acct.provider == Provider::Codex {
+            // Let routing reach the fresh admission check after a policy edit.
+            // Explicit provider cooldowns and counters must survive the edit.
+            acct.state.lock().quota = Quota::default();
+        }
+    }
+}
+
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
 pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     let (token, account_id) = match &*acct.cred.read() {
@@ -381,8 +405,8 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     let mut st = acct.state.lock();
     if !windows.is_empty() {
         st.quota.set(windows, plan);
-        st.quota.on_credits = on_credits;
     }
+    st.quota.on_credits = on_credits;
     Ok(())
 }
 
@@ -591,7 +615,45 @@ mod tests {
         assert_eq!(acct.cooling_until("gpt-6.1-sol"), Some(until));
         usage["credits"]["balance"] = "25".into();
         usage["rate_limit"]["allowed"] = false.into();
-        assert!(!codex_polled_quota(&usage, 100.0, true).2);
+        assert!(codex_polled_quota(&usage, 100.0, true).2);
+        assert!(subscription_windows(&usage, 100.0, true).unwrap().1);
+        assert!(subscription_windows(&usage, 100.0, false).is_err());
+        for (reached, used) in [(false, 100), (true, 20), (true, 101), (true, -1)] {
+            usage["rate_limit"]["limit_reached"] = reached.into();
+            usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
+            assert!(subscription_windows(&usage, 100.0, true).is_err());
+            assert!(!codex_polled_quota(&usage, 100.0, true).2);
+        }
+        usage["rate_limit"]["limit_reached"] = true.into();
+        usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
+        usage["rate_limit"]["primary_window"]["reset_at"] = (Utc::now().timestamp() - 1).into();
+        assert!(subscription_windows(&usage, 100.0, true).is_err());
+        usage["rate_limit"]["primary_window"]["reset_at"] = Value::Null;
+        assert!(subscription_windows(&usage, 100.0, true).is_err());
+        usage["rate_limit"]["primary_window"]["reset_at"] =
+            (Utc::now() + chrono::Duration::hours(1)).timestamp().into();
+        for duration in [Value::Null, json!(0), json!(-1), json!("604800")] {
+            usage["rate_limit"]["primary_window"]["limit_window_seconds"] = duration;
+            assert!(subscription_windows(&usage, 100.0, true).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_edits_invalidate_quota_without_resetting_provider_cooldowns() {
+        let acct = Arc::new(account(Credential::ApiKey { key: "test".into(), base_url: None }));
+        let until = Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = acct.state.lock();
+            st.quota.set(
+                vec![Window { name: "week".into(), used: 100.0, resets_at: Some(until), model: None }],
+                Some("pro".into()),
+            );
+            st.cooldowns.insert("gpt-6.1-sol".into(), until);
+        }
+        invalidate_policy_cache(vec![acct.clone()]);
+        assert!(acct.state.lock().quota.updated_at.is_none());
+        assert!(acct.cooling_until("gpt-6-luna").is_none());
+        assert_eq!(acct.cooling_until("gpt-6.1-sol"), Some(until));
     }
 
     #[test]
