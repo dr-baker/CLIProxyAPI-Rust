@@ -506,7 +506,8 @@ mod tests {
                 ..Default::default()
             },
             "unused.yaml".into(),
-        );
+        )
+        .unwrap();
         let acct = Arc::new(account(Credential::ApiKey { key: "synthetic-key".into(), base_url: None }));
         let error = require_subscription(&app, &acct, "gpt-6.1-sol").await.unwrap_err();
         assert!(error.to_string().contains("API keys"));
@@ -534,7 +535,8 @@ mod tests {
         let app = App::new(
             crate::config::Config { auth_dir: "/nonexistent".into(), ..Default::default() },
             "unused.yaml".into(),
-        );
+        )
+        .unwrap();
         let acct = Arc::new(account(Credential::ApiKey { key: "synthetic-key".into(), base_url: None }));
         assert!(require_subscription(&app, &acct, "gpt-6.1-sol").await.is_ok());
     }

@@ -925,7 +925,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cliproxy-outcomes-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = crate::config::Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() };
-        let app = App::new(cfg, dir.join("config.yaml"));
+        let app = App::new(cfg, dir.join("config.yaml")).unwrap();
         let mut ok = Tracker::new(&app, Format::Responses, true, "http", "test");
         ok.finish(200, &Usage::default(), None);
         ok.downstream_write_failed(&Usage::default());

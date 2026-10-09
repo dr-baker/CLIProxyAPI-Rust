@@ -1,0 +1,20 @@
+[package]
+name = "capture-lifecycle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Locked daily JSONL capture roots and durable offline closure receipts"
+license = "Unlicense"
+repository = "https://github.com/dr-baker/CLIProxyAPI-Rust"
+readme = "README.md"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

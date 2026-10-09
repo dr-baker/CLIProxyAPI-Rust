@@ -1,5 +1,6 @@
 //! Synthetic archive diagnostics; no credentials, upstream calls, or production files.
 use super::*;
+use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -50,7 +51,8 @@ fn buffered_json_preserves_bytes_and_reduces_write_calls() {
 async fn measure(background: bool) -> Value {
     let dir = std::env::temp_dir().join(format!("cliproxy-heartbeat-{}", uuid::Uuid::new_v4()));
     let cfg = Config { request_log: true, request_log_dir: dir.to_string_lossy().into(), ..Default::default() };
-    let audit = Arc::new(Audit::new(&cfg));
+    capture_lifecycle::enroll(&dir, CaptureLayout::Proxy, Utc::now().date_naive()).unwrap();
+    let audit = Arc::new(Audit::new(&cfg).unwrap());
     let legacy_lock = Arc::new(Mutex::new(()));
     let done = Arc::new(AtomicBool::new(false));
     let monitor_done = done.clone();

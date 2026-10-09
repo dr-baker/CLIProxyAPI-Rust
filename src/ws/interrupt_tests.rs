@@ -64,7 +64,13 @@ async fn interrupt_precedes_terminal_preserves_next_create_socket_and_opaque_his
     let mut cfg = (*app.cfg()).clone();
     cfg.request_log = true;
     cfg.request_log_dir = directory.join("audit").to_string_lossy().into();
-    app.set_config(cfg);
+    capture_lifecycle::enroll(
+        directory.join("audit"),
+        capture_lifecycle::CaptureLayout::Proxy,
+        chrono::Utc::now().date_naive(),
+    )
+    .unwrap();
+    app.set_config(cfg).unwrap();
     let (mut up, mut backend) = admission_socket().await;
     let (mut client, mut peer, server) = client_socket().await;
     let acct = account();

@@ -379,4 +379,34 @@ The queue allows 1,024 records and a conservative 64 MiB estimate of owned recor
 
 The management overview exposes archive queue size, written records, dropped payloads, dropped summaries, and write errors. Live request totals remain independent of archive coverage. A queued record is not yet durable: the writer flushes each record and calls `sync_all` for summaries. Normal server shutdown drains accepted records and can wait for disk I/O. A crash can lose queued records; a partial write can leave an incomplete JSONL tail.
 
+Every archive wrapper includes a `process_instance_id` UUID generated once per proxy process. Combine it with `request_id` to join records without PID reuse ambiguity. It stays stable across capture config reloads and changes after a process restart. Original wire data stays inside `data`, including any original fields with the same name. The persistent capture root UUID identifies storage separately.
+
 Run the synthetic scheduler comparison with `cargo test --locked archive_scheduler_probe -- --ignored --nocapture`. Recorded debug-build results are in `diagnostics/background-archive-writer.json`; they measure scheduler delay under synthetic archive traffic, not model TPS.
+
+### Enroll and seal capture files
+
+Capture-enabled startup requires an enrolled `request-log-dir`. Stop and drain every existing proxy before the first enrollment. Legacy binaries ignore the producer lock.
+
+```sh
+cliproxyapi-rust archive enroll --directory ./request-logs
+```
+
+Start the proxy after enrollment. A second producer fails immediately. Config reloads retain the guards for previous capture directories until the writer drains and closes its files. Invalid capture configuration is rejected before management endpoints rewrite the config file.
+
+To seal historical files, stop and drain the proxy, then run:
+
+```sh
+cliproxyapi-rust archive seal --directory ./request-logs --before 2026-10-01
+```
+
+To limit hashing to one relative source path, add `--file`:
+
+```sh
+cliproxyapi-rust archive seal --directory ./request-logs --before 2026-10-01 --file rust-2026-09-25.jsonl
+```
+
+The command keeps the latest two files by filename and by modification time, two hot days, and the active storage day. `--keep-latest` can increase the retained pairs. Partial tails remain untouched. Receipts bind the exact source identity, length, and SHA-256. These commands do not load account credentials, start the server, or delete capture files.
+
+The persisted storage-day floor prevents clock rollback or delayed records from reopening sealed paths. Records keep their original event timestamps. Never remove `.capture-root.json` or `.capture-state/`, including after raw capture retirement. A rollback binary must honor this contract or use a separate root.
+
+The shared [capture lifecycle contract](crates/capture-lifecycle/README.md) documents the public API and receipt fields. Durable sealing is supported on Linux and macOS. Windows capture remains available; sealing reports `Unsupported`.

@@ -22,7 +22,7 @@ impl Fixture {
         let dir = std::env::temp_dir().join(format!("cliproxy-body-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() };
-        let app = App::new(cfg, dir.join("config.yaml"));
+        let app = App::new(cfg, dir.join("config.yaml")).unwrap();
         Self { dir, app }
     }
 
@@ -153,7 +153,7 @@ async fn authentication_runs_before_body_decoding() {
     let fixture = Fixture::new();
     let mut cfg = (*fixture.app.cfg()).clone();
     cfg.api_keys = vec!["local-test-key".into()];
-    fixture.app.set_config(cfg);
+    fixture.app.set_config(cfg).unwrap();
     let (status, response) = request(fixture.app.clone(), "/v1/responses", Some("zstd"), b"corrupt".to_vec()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(response["error"]["message"], "invalid or missing API key");
