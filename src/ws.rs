@@ -26,6 +26,138 @@ use crate::state::App;
 
 type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type ClientTx = futures::stream::SplitSink<WebSocket, Message>;
+type ClientRx = futures::stream::SplitStream<WebSocket>;
+
+struct Client {
+    tx: ClientTx,
+    rx: ClientRx,
+    // Keep one follow-up create in order while continuing to receive controls.
+    pending: Option<ClientCreate>,
+}
+
+struct ClientCreate {
+    request_id: u64,
+    body: Value,
+}
+
+enum ClientFrame {
+    Create(ClientCreate),
+    Interrupt { request_id: u64, body: Value },
+    Invalid { request_id: u64, message: String },
+    Ignore,
+    Closed,
+}
+
+fn client_frame(app: &App, message: Option<Result<Message, axum::Error>>) -> ClientFrame {
+    let text = match message {
+        Some(Ok(Message::Text(text))) => text.to_string(),
+        Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return ClientFrame::Closed,
+        _ => return ClientFrame::Ignore,
+    };
+    let request_id = app.stats.next_id();
+    let parsed = serde_json::from_str::<Value>(&text);
+    audit(
+        app,
+        request_id,
+        "downstream_request",
+        parsed.as_ref().map(Value::clone).unwrap_or_else(|_| Value::String(text)),
+    );
+    let Ok(mut body) = parsed else {
+        return ClientFrame::Invalid { request_id, message: "invalid JSON".into() };
+    };
+    match body["type"].as_str() {
+        Some("response.create") => {
+            body.as_object_mut().unwrap().remove("type");
+            ClientFrame::Create(ClientCreate { request_id, body })
+        }
+        Some("response.interrupt") => {
+            if body["response_id"].as_str().is_none_or(|id| id.trim().is_empty()) {
+                return ClientFrame::Invalid {
+                    request_id,
+                    message: "response.interrupt requires a response_id".into(),
+                };
+            }
+            if body["mode"] != "discard_partial_items" {
+                return ClientFrame::Invalid {
+                    request_id,
+                    message: "response.interrupt requires mode discard_partial_items".into(),
+                };
+            }
+            ClientFrame::Interrupt { request_id, body }
+        }
+        _ => ClientFrame::Invalid {
+            request_id,
+            message: format!("unsupported message type `{}`", body["type"].as_str().unwrap_or_default()),
+        },
+    }
+}
+
+enum ActiveInput {
+    Interrupt { request_id: u64, body: Value },
+    Invalid { request_id: u64, message: String },
+    Continue,
+    Closed,
+}
+
+fn active_input(client: &mut Client, sess: &Session, response_id: Option<&str>, frame: ClientFrame) -> ActiveInput {
+    match frame {
+        ClientFrame::Create(create) => {
+            if client.pending.is_some() {
+                ActiveInput::Invalid {
+                    request_id: create.request_id,
+                    message: "a follow-up response.create is already queued".into(),
+                }
+            } else {
+                client.pending = Some(create);
+                ActiveInput::Continue
+            }
+        }
+        ClientFrame::Interrupt { request_id, body } => {
+            let id = body["response_id"].as_str().unwrap();
+            if response_id == Some(id) {
+                ActiveInput::Interrupt { request_id, body }
+            } else if sess.contains(id) {
+                // Completion and interrupt can race; a completed response needs no control.
+                ActiveInput::Continue
+            } else {
+                ActiveInput::Invalid {
+                    request_id,
+                    message: "response_id does not match a response on this websocket".into(),
+                }
+            }
+        }
+        ClientFrame::Invalid { request_id, message } => ActiveInput::Invalid { request_id, message },
+        ClientFrame::Ignore => ActiveInput::Continue,
+        ClientFrame::Closed => ActiveInput::Closed,
+    }
+}
+
+fn idle_input(sess: &Session, frame: ClientFrame) -> ClientFrame {
+    match frame {
+        ClientFrame::Interrupt { request_id, body } => {
+            if sess.contains(body["response_id"].as_str().unwrap()) {
+                ClientFrame::Ignore
+            } else {
+                ClientFrame::Invalid {
+                    request_id,
+                    message: "response_id does not match a response on this websocket".into(),
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+async fn invalid_frame(app: &App, client: &mut Client, request_id: u64, message: &str) -> Result<(), ClientGone> {
+    send(
+        app,
+        request_id,
+        &mut client.tx,
+        error_event(400, &json!({"error":{"message":message,"type":"invalid_request_error"}})),
+    )
+    .await
+}
 
 const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IDLE_DRAIN: usize = 32;
@@ -99,6 +231,10 @@ struct Session {
 }
 
 impl Session {
+    fn contains(&self, id: &str) -> bool {
+        self.history.iter().any(|(known, _)| known == id)
+    }
+
     fn discard_upstream(&mut self) -> Option<(Arc<Account>, Upstream)> {
         self.upstream_ids.clear();
         self.upstream.take()
@@ -147,13 +283,22 @@ impl TurnOutput {
     }
 
     fn captured_items(&self, response: &Value) -> Vec<Value> {
-        if let Some(output) = response["output"].as_array().filter(|output| !output.is_empty()) {
+        let interrupted = response["incomplete_details"]["reason"] == "interrupted";
+        let items = if let Some(output) = response["output"].as_array().filter(|output| !output.is_empty()) {
             output.clone()
         } else {
-            // Codex can put all output in item.done events and leave the final
-            // response output empty. Reconstruct history without changing wire events.
+            // Codex can put completed items in item.done events and leave final
+            // output empty, including interrupted turns. Preserve complete raw
+            // items for replay while filtering partial items below.
             self.items.values().cloned().collect()
-        }
+        };
+        items
+            .into_iter()
+            .filter(|item| {
+                !interrupted
+                    || !matches!(item["status"].as_str(), Some("in_progress" | "incomplete" | "cancelled" | "canceled"))
+            })
+            .collect()
     }
 }
 
@@ -321,69 +466,42 @@ fn normalize_completion(event: &mut Value) -> bool {
 }
 
 pub async fn handle(app: Arc<App>, headers: HeaderMap, socket: WebSocket) {
-    let (mut tx, mut rx) = socket.split();
+    let (tx, rx) = socket.split();
+    let mut client = Client { tx, rx, pending: None };
     let mut sess = Session { connection_id: uuid::Uuid::new_v4().to_string(), ..Default::default() };
     loop {
-        let msg = tokio::select! {
-            // The client gets priority; queued upstream frames are drained before submission.
-            biased;
-            msg = rx.next() => {
-                let Some(msg) = msg else { break };
-                msg
-            }
-            upstream = async {
-                match &mut sess.upstream {
-                    Some((_, up)) => up.next().await,
-                    None => std::future::pending().await,
+        let frame = if let Some(create) = client.pending.take() {
+            ClientFrame::Create(create)
+        } else {
+            tokio::select! {
+                biased;
+                message = client.rx.next() => client_frame(&app, message),
+                upstream = async {
+                    match &mut sess.upstream {
+                        Some((_, up)) => up.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    idle_upstream(&app, &mut sess, upstream).await;
+                    continue;
                 }
-            } => {
-                idle_upstream(&app, &mut sess, upstream).await;
-                continue;
             }
         };
-        let text = match msg {
-            Ok(Message::Text(t)) => t.to_string(),
-            Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => continue,
-        };
-        let request_id = app.stats.next_id();
-        audit(
-            &app,
-            request_id,
-            "downstream_request",
-            serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone())),
-        );
-        let Ok(mut body) = serde_json::from_str::<Value>(&text) else {
-            if send(&app, request_id, &mut tx, error_event(400, &json!({ "error": { "message": "invalid JSON" } })))
-                .await
-                .is_err()
-            {
-                break;
+        match idle_input(&sess, frame) {
+            ClientFrame::Create(create) => {
+                drain_idle_upstream(&app, &mut sess).await;
+                if turn(&app, create.request_id, &headers, &mut sess, create.body, &mut client).await.is_err() {
+                    break;
+                }
             }
-            continue;
-        };
-        if body["type"] != "response.create" {
-            let msg = format!("unsupported message type `{}`", body["type"].as_str().unwrap_or_default());
-            if send(
-                &app,
-                request_id,
-                &mut tx,
-                error_event(400, &json!({ "error": { "message": msg, "type": "invalid_request_error" } })),
-            )
-            .await
-            .is_err()
-            {
-                break;
+            ClientFrame::Interrupt { .. } => unreachable!("idle_input handles interrupts"),
+            ClientFrame::Invalid { request_id, message } => {
+                if invalid_frame(&app, &mut client, request_id, &message).await.is_err() {
+                    break;
+                }
             }
-            continue;
-        }
-        if let Some(o) = body.as_object_mut() {
-            o.remove("type");
-        }
-        drain_idle_upstream(&app, &mut sess).await;
-        if turn(&app, request_id, &headers, &mut sess, body, &mut tx).await.is_err() {
-            break;
+            ClientFrame::Ignore => {}
+            ClientFrame::Closed => break,
         }
     }
     sess.close_upstream("client_closed").await;
@@ -395,7 +513,7 @@ async fn turn(
     headers: &HeaderMap,
     sess: &mut Session,
     mut body: Value,
-    tx: &mut ClientTx,
+    client: &mut Client,
 ) -> Result<(), ClientGone> {
     // Full conversation for local history (and for providers without server state).
     let prev = body["previous_response_id"].as_str().map(String::from);
@@ -404,11 +522,13 @@ async fn turn(
 
     let cfg = app.cfg();
     if cfg.codex_websockets {
-        match native_turn(app, request_id, headers, sess, &body, &full, tx).await {
+        match native_turn(app, request_id, headers, sess, &body, &full, client).await {
             Native::Done => return Ok(()),
             Native::Gone => return Err(ClientGone),
             Native::Fallback => {}
-            Native::Error(status, error) => return send(app, request_id, tx, error_event(status, &error)).await,
+            Native::Error(status, error) => {
+                return send(app, request_id, &mut client.tx, error_event(status, &error)).await;
+            }
         }
     } else if let Native::Error(status, error) = unavailable(&cfg, &body, "codex-websockets is disabled") {
         let mut tracker = Tracker::new_with_id(
@@ -420,12 +540,12 @@ async fn turn(
             request_id,
         );
         tracker.finish(status, &Usage::default(), Some(proxy::error_message(&error.to_string())));
-        return send(app, request_id, tx, error_event(status, &error)).await;
+        return send(app, request_id, &mut client.tx, error_event(status, &error)).await;
     }
 
     if let Some(id) = &prev {
         if sess.lookup(id).is_none() {
-            return send(app, request_id, tx, error_event(400, &previous_missing())).await;
+            return send(app, request_id, &mut client.tx, error_event(400, &previous_missing())).await;
         }
         body["input"] = Value::Array(full.clone());
         body.as_object_mut().unwrap().remove("previous_response_id");
@@ -442,28 +562,64 @@ async fn turn(
         request_id: Some(request_id),
     };
     match proxy::execute(app.clone(), call).await {
-        Reply::Stream { mut frames, .. } => {
-            let mut output = TurnOutput::default();
-            while let Some(mut f) = frames.next().await {
-                let mut event = serde_json::from_str::<Value>(&f.data).unwrap_or(Value::Null);
-                output.observe(&event, f.event.as_deref());
-                if normalize_completion(&mut event) {
-                    f.data = event.to_string();
-                }
-                if matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete"))
-                    || matches!(f.event.as_deref(), Some("response.completed" | "response.incomplete"))
-                {
-                    let _ = capture(sess, &event, &full, &output);
-                }
-                send(app, request_id, tx, f.data).await?;
-            }
-            Ok(())
-        }
+        Reply::Stream { frames, .. } => relay_http_response(app, request_id, sess, &full, client, frames).await,
         Reply::Json(v) => {
             let _ = capture(sess, &json!({ "response": v }), &full, &TurnOutput::default());
-            send(app, request_id, tx, json!({ "type": "response.completed", "response": v }).to_string()).await
+            send(app, request_id, &mut client.tx, json!({ "type": "response.completed", "response": v }).to_string())
+                .await
         }
-        Reply::Error(status, body) => send(app, request_id, tx, error_event(status, &body)).await,
+        Reply::Error(status, body) => send(app, request_id, &mut client.tx, error_event(status, &body)).await,
+    }
+}
+
+async fn relay_http_response(
+    app: &Arc<App>,
+    request_id: u64,
+    sess: &mut Session,
+    full: &[Value],
+    client: &mut Client,
+    mut frames: proxy::FrameStream,
+) -> Result<(), ClientGone> {
+    let mut output = TurnOutput::default();
+    let mut response_id = None;
+    loop {
+        let next = tokio::select! {
+            next = frames.next() => next,
+            message = client.rx.next() => {
+                let frame = client_frame(app, message);
+                match active_input(client, sess, response_id.as_deref(), frame) {
+                    ActiveInput::Interrupt { request_id: control_id, .. } => {
+                        // An HTTP body has no channel for native response controls.
+                        // Drop the stream and report that limitation without fabricating
+                        // a completed response, token usage, or another generation.
+                        return send(app, control_id, &mut client.tx, error_event(400, &json!({"error":{
+                            "message":"response.interrupt requires an upstream websocket; the HTTP response stream was closed",
+                            "type":"invalid_request_error", "code":"response_interrupt_unsupported"
+                        }}))).await;
+                    }
+                    ActiveInput::Invalid { request_id, message } => invalid_frame(app, client, request_id, &message).await?,
+                    ActiveInput::Closed => return Err(ClientGone),
+                    ActiveInput::Continue => {}
+                }
+                continue;
+            }
+        };
+        let Some(mut frame) = next else { return Ok(()) };
+        let mut event = serde_json::from_str::<Value>(&frame.data).unwrap_or(Value::Null);
+        output.observe(&event, frame.event.as_deref());
+        if normalize_completion(&mut event) {
+            frame.data = event.to_string();
+        }
+        if event["type"] == "response.created" || frame.event.as_deref() == Some("response.created") {
+            response_id = event["response"]["id"].as_str().map(String::from);
+        }
+        if matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete"))
+            || matches!(frame.event.as_deref(), Some("response.completed" | "response.incomplete"))
+        {
+            let _ = capture(sess, &event, full, &output);
+            response_id = None;
+        }
+        send(app, request_id, &mut client.tx, frame.data).await?;
     }
 }
 
@@ -600,7 +756,7 @@ async fn native_turn(
     sess: &mut Session,
     body: &Value,
     full: &[Value],
-    tx: &mut ClientTx,
+    client: &mut Client,
 ) -> Native {
     let cfg = app.cfg();
     let (model, suffix) = ir::split_model_suffix(body["model"].as_str().unwrap_or_default());
@@ -724,6 +880,26 @@ async fn native_turn(
         return Native::Error(failure.status, json!({"error":{"message":failure.message, "type":"upstream_error"}}));
     }
 
+    relay_native_response(app, sess, body, full, client, NativeResponse { acct, up, tracker, model }).await
+}
+
+struct NativeResponse {
+    acct: Arc<Account>,
+    up: Upstream,
+    tracker: Tracker,
+    model: String,
+}
+
+async fn relay_native_response(
+    app: &Arc<App>,
+    sess: &mut Session,
+    body: &Value,
+    full: &[Value],
+    client: &mut Client,
+    response: NativeResponse,
+) -> Native {
+    let cfg = app.cfg();
+    let NativeResponse { acct, mut up, mut tracker, model } = response;
     let mut parser = responses::Parser::default();
     let mut output = TurnOutput::default();
     let mut usage = Usage::default();
@@ -731,8 +907,45 @@ async fn native_turn(
     let mut error: Option<(u16, String)> = None;
     let mut forwarded = false;
     let mut terminal = false;
+    let mut response_id = None;
+    let mut interrupt_sent = false;
+    let mut interrupted_terminal = false;
+    let mut read_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     loop {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(600), up.next()).await;
+        let next = tokio::select! {
+            next = tokio::time::timeout_at(read_deadline, up.next()) => next,
+            message = client.rx.next() => {
+                let frame = client_frame(app, message);
+                match active_input(client, sess, response_id.as_deref(), frame) {
+                    ActiveInput::Interrupt { request_id, body } => {
+                        if !interrupt_sent {
+                            audit(app, request_id, "upstream_control", body.clone());
+                            if let Err(failure) = upstream_write("interrupt", up.send(tungstenite::Message::Text(body.to_string().into()))).await {
+                                failure.log(&sess.connection_id, "turn_interrupt");
+                                error = Some((failure.status, failure.message));
+                                break;
+                            }
+                            interrupt_sent = true;
+                        }
+                    }
+                    ActiveInput::Invalid { request_id, message } => {
+                        if invalid_frame(app, client, request_id, &message).await.is_err() {
+                            tracker.downstream_write_failed(&usage);
+                            return Native::Gone;
+                        }
+                    }
+                    ActiveInput::Closed => {
+                        sess.upstream_ids.clear();
+                        tracker.finish(499, &usage, Some("client websocket closed during response".into()));
+                        return Native::Gone;
+                    }
+                    ActiveInput::Continue => {}
+                }
+                // Client chatter must not extend the upstream read deadline.
+                continue;
+            }
+        };
+        read_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
         let mut text = match next {
             Ok(Some(Ok(tungstenite::Message::Text(t)))) => t.to_string(),
             Ok(Some(Ok(tungstenite::Message::Binary(b)))) => String::from_utf8_lossy(&b).into_owned(),
@@ -788,6 +1001,9 @@ async fn native_turn(
             text = v.to_string();
         }
         let kind = v["type"].as_str().unwrap_or_default().to_string();
+        if kind == "response.created" {
+            response_id = v["response"]["id"].as_str().map(String::from);
+        }
         crate::quota::observe_codex_event(&acct, &v);
         parser.feed(&SseEvent { event: None, data: text.clone() }, &mut evs);
         for ev in evs.drain(..) {
@@ -816,7 +1032,11 @@ async fn native_turn(
                 return Native::Fallback;
             }
             tracker.finish(status, &usage, Some(msg));
-            return if send(app, tracker.id(), tx, text).await.is_err() { Native::Gone } else { Native::Done };
+            return if send(app, tracker.id(), &mut client.tx, text).await.is_err() {
+                Native::Gone
+            } else {
+                Native::Done
+            };
         }
         if (kind == "response.completed" || kind == "response.incomplete")
             && let Some(id) = capture(sess, &v, full, &output)
@@ -824,8 +1044,10 @@ async fn native_turn(
             sess.remember_upstream(id);
         }
         terminal = matches!(kind.as_str(), "response.completed" | "response.incomplete" | "response.failed" | "error");
+        interrupted_terminal =
+            kind == "response.incomplete" && v["response"]["incomplete_details"]["reason"] == "interrupted";
         forwarded = true;
-        if send(app, tracker.id(), tx, text).await.is_err() {
+        if send(app, tracker.id(), &mut client.tx, text).await.is_err() {
             tracker.downstream_write_failed(&usage);
             return Native::Gone;
         }
@@ -840,13 +1062,14 @@ async fn native_turn(
         sess.upstream_ids.clear();
         let (status, msg) = error.clone().unwrap_or((502, "codex websocket closed".into()));
         let body = json!({ "error": { "message": msg, "type": "upstream_error" } });
-        if send(app, tracker.id(), tx, error_event(status, &body)).await.is_err() {
+        if send(app, tracker.id(), &mut client.tx, error_event(status, &body)).await.is_err() {
             tracker.finish(status, &usage, Some(msg));
             return Native::Gone;
         }
     }
     match error {
         Some((s, m)) => tracker.finish(s, &usage, Some(m)),
+        None if interrupted_terminal => tracker.response_interrupted(&usage),
         None => {
             acct.record_ok();
             tracker.finish(200, &usage, None)
@@ -856,13 +1079,17 @@ async fn native_turn(
 }
 
 #[cfg(test)]
+#[path = "ws/interrupt_tests.rs"]
+mod interrupt_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::accounts::{AccountState, Credential, OAuth};
     use parking_lot::{Mutex, RwLock};
     use std::collections::BTreeMap;
 
-    fn account() -> Arc<Account> {
+    pub(super) fn account() -> Arc<Account> {
         Arc::new(Account {
             id: "test-codex-account".into(),
             provider: Provider::Codex,
@@ -1048,7 +1275,7 @@ mod tests {
         assert_eq!(output.captured_items(&response), vec![final_item]);
     }
 
-    async fn admission_socket() -> (Upstream, tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+    pub(super) async fn admission_socket() -> (Upstream, tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/responses", listener.local_addr().unwrap());
         let (client, server) = tokio::join!(tokio_tungstenite::connect_async(url), async {
@@ -1058,7 +1285,7 @@ mod tests {
         (client.unwrap().0, server)
     }
 
-    fn admission_app() -> (Arc<App>, std::path::PathBuf) {
+    pub(super) fn admission_app() -> (Arc<App>, std::path::PathBuf) {
         let directory = std::env::temp_dir().join(format!("cliproxy-idle-admission-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let config = Config { auth_dir: directory.to_string_lossy().into(), ..Default::default() };
@@ -1173,6 +1400,7 @@ mod io_tests {
         let (mut sender, _sender_peer) = blocked_upstream().await;
         let (mut flusher, _flusher_peer) = blocked_upstream().await;
         let (mut closer, _closer_peer) = blocked_upstream().await;
+        let (mut interrupter, _interrupt_peer) = blocked_upstream().await;
         // Feed queues a frame; the unread one-byte transport blocks its flush.
         flusher.feed(tungstenite::Message::Text("queued request".into())).await.unwrap();
         let started = tokio::time::Instant::now();
@@ -1181,12 +1409,15 @@ mod io_tests {
                 upstream_write("send", sender.send(tungstenite::Message::Text("submitted request".into()))),
                 upstream_write("flush", flusher.flush()),
                 upstream_write("close", closer.close(None)),
+                upstream_write("interrupt", interrupter.send(tungstenite::Message::Text("control".into()))),
             )
         })
         .await
         .expect("blocked websocket writes outlived their deadline");
         assert!(started.elapsed() >= UPSTREAM_WRITE_TIMEOUT);
-        for (operation, result) in [("send", failures.0), ("flush", failures.1), ("close", failures.2)] {
+        for (operation, result) in
+            [("send", failures.0), ("flush", failures.1), ("close", failures.2), ("interrupt", failures.3)]
+        {
             let failure = result.expect_err("an unread duplex transport must block");
             assert_eq!(failure.status, 504);
             assert_eq!(failure.operation, operation);

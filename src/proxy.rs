@@ -130,6 +130,15 @@ impl Tracker {
         self.finish(499, usage, Some("downstream write failed".into()));
     }
 
+    /// The upstream acknowledged a graceful response interrupt with real usage.
+    pub fn response_interrupted(&mut self, usage: &Usage) {
+        if self.done {
+            return;
+        }
+        self.log.termination_reason = Some(crate::state::TerminationReason::ResponseInterrupted);
+        self.finish(499, usage, Some("upstream response interrupted".into()));
+    }
+
     pub fn finish(&mut self, status: u16, usage: &Usage, error: Option<String>) {
         if self.done {
             return;
