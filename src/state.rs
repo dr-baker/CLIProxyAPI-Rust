@@ -146,11 +146,13 @@ impl Http {
 
 // ----------------------------------------------------------------------- stats
 
-/// Why a request ended without a completed response; this does not establish client intent.
+/// Why a request ended without a successful completion.
+/// Transport failures alone do not establish client intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminationReason {
     DownstreamWriteFailed,
+    ResponseInterrupted,
     Unfinished,
 }
 
@@ -182,6 +184,7 @@ pub struct Totals {
     pub failed: u64,
     pub interrupted: u64,
     pub downstream_write_failed: u64,
+    pub response_interrupted: u64,
     pub unfinished: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -195,6 +198,7 @@ pub struct Bucket {
     pub failed: u64,
     pub interrupted: u64,
     pub downstream_write_failed: u64,
+    pub response_interrupted: u64,
     pub unfinished: u64,
     pub tokens: u64,
 }
@@ -228,6 +232,7 @@ impl Stats {
                 t.interrupted += 1;
                 match log.termination_reason {
                     Some(TerminationReason::DownstreamWriteFailed) => t.downstream_write_failed += 1,
+                    Some(TerminationReason::ResponseInterrupted) => t.response_interrupted += 1,
                     _ => t.unfinished += 1,
                 }
             } else {
@@ -252,6 +257,7 @@ impl Stats {
                 b.interrupted += 1;
                 match log.termination_reason {
                     Some(TerminationReason::DownstreamWriteFailed) => b.downstream_write_failed += 1,
+                    Some(TerminationReason::ResponseInterrupted) => b.response_interrupted += 1,
                     _ => b.unfinished += 1,
                 }
             } else if !ok {
