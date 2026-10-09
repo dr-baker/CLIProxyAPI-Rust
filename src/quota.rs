@@ -362,6 +362,17 @@ pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -
     }
 }
 
+/// Invalidate policy-dependent routing state after a configuration edit.
+pub fn invalidate_policy_cache(accounts: Vec<Arc<Account>>) {
+    for acct in accounts {
+        if acct.provider == Provider::Codex {
+            // Let routing reach the fresh admission check after a policy edit.
+            // Explicit provider cooldowns and counters must survive the edit.
+            acct.state.lock().quota = Quota::default();
+        }
+    }
+}
+
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
 pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     let (token, account_id) = match &*acct.cred.read() {
@@ -394,8 +405,8 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     let mut st = acct.state.lock();
     if !windows.is_empty() {
         st.quota.set(windows, plan);
-        st.quota.on_credits = on_credits;
     }
+    st.quota.on_credits = on_credits;
     Ok(())
 }
 
@@ -617,6 +628,32 @@ mod tests {
         usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
         usage["rate_limit"]["primary_window"]["reset_at"] = (Utc::now().timestamp() - 1).into();
         assert!(subscription_windows(&usage, 100.0, true).is_err());
+        usage["rate_limit"]["primary_window"]["reset_at"] = Value::Null;
+        assert!(subscription_windows(&usage, 100.0, true).is_err());
+        usage["rate_limit"]["primary_window"]["reset_at"] =
+            (Utc::now() + chrono::Duration::hours(1)).timestamp().into();
+        for duration in [Value::Null, json!(0), json!(-1), json!("604800")] {
+            usage["rate_limit"]["primary_window"]["limit_window_seconds"] = duration;
+            assert!(subscription_windows(&usage, 100.0, true).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_edits_invalidate_quota_without_resetting_provider_cooldowns() {
+        let acct = Arc::new(account(Credential::ApiKey { key: "test".into(), base_url: None }));
+        let until = Utc::now() + chrono::Duration::hours(1);
+        {
+            let mut st = acct.state.lock();
+            st.quota.set(
+                vec![Window { name: "week".into(), used: 100.0, resets_at: Some(until), model: None }],
+                Some("pro".into()),
+            );
+            st.cooldowns.insert("gpt-6.1-sol".into(), until);
+        }
+        invalidate_policy_cache(vec![acct.clone()]);
+        assert!(acct.state.lock().quota.updated_at.is_none());
+        assert!(acct.cooling_until("gpt-6-luna").is_none());
+        assert_eq!(acct.cooling_until("gpt-6.1-sol"), Some(until));
     }
 
     #[test]

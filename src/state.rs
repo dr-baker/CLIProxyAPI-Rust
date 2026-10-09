@@ -60,10 +60,17 @@ impl App {
     }
 
     pub fn set_prepared_config(&self, cfg: Config, capture: crate::audit::PreparedCapture) -> std::io::Result<()> {
+        let previous = self.cfg();
+        let quota_policy_changed = previous.codex_subscription_credits != cfg.codex_subscription_credits
+            || previous.codex_subscription_only != cfg.codex_subscription_only
+            || previous.subscription_usage_ceiling_percent != cfg.subscription_usage_ceiling_percent;
         self.audit.apply_configuration(capture)?;
         self.http.set_default_proxy(&cfg.proxy_url);
         self.pool.reload(&cfg);
         self.cfg.store(Arc::new(cfg));
+        if quota_policy_changed {
+            crate::quota::invalidate_policy_cache(self.pool.all());
+        }
         self.broadcast("accounts", serde_json::Value::Null);
         Ok(())
     }
