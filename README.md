@@ -379,6 +379,8 @@ The queue allows 1,024 records and a conservative 64 MiB estimate of owned recor
 
 The management overview exposes archive queue size, written records, dropped payloads, dropped summaries, and write errors. Live request totals remain independent of archive coverage. A queued record is not yet durable: the writer flushes each record and calls `sync_all` for summaries. Normal server shutdown drains accepted records and can wait for disk I/O. A crash can lose queued records; a partial write can leave an incomplete JSONL tail.
 
+Every archive wrapper includes a `process_instance_id` UUID generated once per proxy process. Combine it with `request_id` to join records without PID reuse ambiguity. It stays stable across capture config reloads and changes after a process restart. Original wire data stays inside `data`, including any original fields with the same name. The persistent capture root UUID identifies storage separately.
+
 Run the synthetic scheduler comparison with `cargo test --locked archive_scheduler_probe -- --ignored --nocapture`. Recorded debug-build results are in `diagnostics/background-archive-writer.json`; they measure scheduler delay under synthetic archive traffic, not model TPS.
 
 ### Enroll and seal capture files

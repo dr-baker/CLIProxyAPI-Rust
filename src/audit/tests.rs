@@ -48,6 +48,68 @@ fn capture_path(dir: &std::path::Path) -> PathBuf {
         .unwrap()
 }
 
+#[test]
+fn process_identity_is_stable_across_audit_reconfiguration_and_preserves_original_data() {
+    let (cfg, first) = config();
+    let (next, second) = config();
+    let root_id = capture_lifecycle::enroll(&first, CaptureLayout::Proxy, Utc::now().date_naive()).unwrap().root_uuid;
+    let audit = Audit::new(&cfg).unwrap();
+    let original = json!({"type":"response.output_text.delta","delta":"synthetic","process_instance_id":"wire-value"});
+    for direction in ["client_request", "upstream_event", "summary"] {
+        audit.record(1, direction, "websocket", original.clone()).unwrap();
+    }
+    audit.configure(&next).unwrap();
+    audit.record(2, "downstream_event", "websocket", original.clone()).unwrap();
+    audit.shutdown().unwrap();
+    let restarted_audit = Audit::new(&cfg).unwrap();
+    restarted_audit.record(1, "summary", "http", original.clone()).unwrap();
+    restarted_audit.shutdown().unwrap();
+    for directory in [&first, &second] {
+        let text = std::fs::read_to_string(capture_path(directory)).unwrap();
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["process_instance_id"], process_instance_id());
+            let id = uuid::Uuid::parse_str(record["process_instance_id"].as_str().unwrap()).unwrap();
+            assert_ne!(id, root_id);
+            assert_eq!(record["process_id"], std::process::id());
+            assert_eq!(record["data"], original);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn process_identity_changes_across_proxy_process_starts() {
+    let (_, dir) = config();
+    for _ in 0..2 {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audit::tests::process_identity_child", "--ignored"])
+            .env("PROXY_AUDIT_PROCESS_TEST_ROOT", &dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "subprocess fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let text = std::fs::read_to_string(capture_path(&dir)).unwrap();
+    let records: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(records.len(), 2);
+    let first = uuid::Uuid::parse_str(records[0]["process_instance_id"].as_str().unwrap()).unwrap();
+    let second = uuid::Uuid::parse_str(records[1]["process_instance_id"].as_str().unwrap()).unwrap();
+    assert_ne!(first, second);
+    assert_ne!(first.to_string(), process_instance_id());
+    assert_ne!(second.to_string(), process_instance_id());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture, called by process_identity_changes_across_proxy_process_starts"]
+fn process_identity_child() {
+    let dir = PathBuf::from(std::env::var_os("PROXY_AUDIT_PROCESS_TEST_ROOT").expect("subprocess fixture root"));
+    let cfg = Config { request_log: true, request_log_dir: dir.to_string_lossy().into(), ..Default::default() };
+    let audit = Audit::new(&cfg).unwrap();
+    audit.record(1, "summary", "test", json!({})).unwrap();
+    audit.shutdown().unwrap();
+}
+
 struct Gate {
     started: mpsc::Receiver<()>,
     open: Arc<(StdMutex<bool>, Condvar)>,

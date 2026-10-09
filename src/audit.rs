@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::JoinHandle;
 
 use capture_lifecycle::{CaptureChannel, CaptureLayout, CaptureRoot};
@@ -25,6 +25,11 @@ struct Limits {
 
 const LIMITS: Limits =
     Limits { records: 1024, payload_records: 960, bytes: 64 << 20, payload_bytes: 60 << 20, record_bytes: 16 << 20 };
+
+fn process_instance_id() -> &'static str {
+    static INSTANCE: OnceLock<String> = OnceLock::new();
+    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
 
 /// Local archive coverage and queue pressure, without payloads or account identifiers.
 #[derive(Default, Clone, Serialize)]
@@ -244,7 +249,7 @@ impl Audit {
         // stay on the writer thread.
         let path = root.path.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
         let record = json!({ "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            "process_id": std::process::id(), "request_id": request_id,
+            "process_id": std::process::id(), "process_instance_id": process_instance_id(), "request_id": request_id,
             "direction": direction, "transport": transport, "data": data });
         let bytes = heap_budget(&record, 0, self.limits.record_bytes)
             .and_then(|bytes| bytes.checked_add(path.as_os_str().len() + 256));
