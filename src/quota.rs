@@ -307,6 +307,12 @@ fn subscription_windows(v: &Value, ceiling: f64, credits: bool) -> Result<(Vec<W
     }
 }
 
+/// Routing and request admission must agree about credit eligibility.
+fn codex_polled_quota(v: &Value, ceiling: f64, credits: bool) -> (Vec<Window>, Option<String>, bool) {
+    let on_credits = subscription_windows(v, ceiling, credits).is_ok_and(|(_, on_credits)| on_credits);
+    (codex_windows(v), v["plan_type"].as_str().map(String::from), on_credits)
+}
+
 /// Checks official subscription allowance before each inference, including on reused sockets.
 /// A preflight cannot prevent provider-side credit charges if a request crosses the remaining allowance.
 pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -> Result<()> {
@@ -319,8 +325,7 @@ pub async fn require_subscription(app: &App, acct: &Arc<Account>, model: &str) -
     ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
     let usage =
         codex_usage(app, acct, &token, Some(&account_id)).await.context("subscription allowance check failed")?;
-    let checked =
-        subscription_windows(&usage, cfg.subscription_usage_ceiling_percent, cfg.codex_subscription_credits);
+    let checked = subscription_windows(&usage, cfg.subscription_usage_ceiling_percent, cfg.codex_subscription_credits);
     let active = app.pool.get(&acct.id).context("subscription account is no longer configured")?;
     ensure!(Arc::ptr_eq(acct, &active) && !acct.state.lock().disabled, "subscription account changed or is disabled");
     ensure!(
@@ -368,11 +373,8 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
         }
         Provider::Codex => {
             let v = codex_usage(app, acct, &token, account_id.as_deref()).await?;
-            let windows = codex_windows(&v);
-            let on_credits = app.cfg().codex_subscription_credits
-                && credits_available(&v["credits"])
-                && windows.iter().any(|w| w.used >= 100.0);
-            (windows, v["plan_type"].as_str().map(String::from), on_credits)
+            let cfg = app.cfg();
+            codex_polled_quota(&v, cfg.subscription_usage_ceiling_percent, cfg.codex_subscription_credits)
         }
         _ => return Ok(()),
     };
@@ -562,6 +564,34 @@ mod tests {
         usage["rate_limit"]["allowed"] = true.into();
         usage["plan_type"] = "team".into();
         assert!(subscription_windows(&usage, 90.0, true).is_err());
+    }
+
+    #[test]
+    fn polled_credits_remove_only_quota_cooldowns() {
+        let mut usage = subscription_usage();
+        usage["rate_limit"]["limit_reached"] = true.into();
+        usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
+        usage["credits"] = json!({ "has_credits": true, "unlimited": false, "balance": "25.00" });
+        let acct = account(Credential::ApiKey { key: "test".into(), base_url: None });
+        for enabled in [false, true] {
+            let (windows, plan, on_credits) = codex_polled_quota(&usage, 100.0, enabled);
+            assert_eq!(on_credits, enabled);
+            assert_eq!(subscription_windows(&usage, 100.0, enabled).is_ok(), enabled);
+            {
+                let mut st = acct.state.lock();
+                st.quota.set(windows, plan);
+                st.quota.on_credits = on_credits;
+            }
+            assert_eq!(acct.cooling_until("gpt-6.1-sol").is_none(), enabled);
+        }
+        usage["credits"]["balance"] = "0".into();
+        assert!(!codex_polled_quota(&usage, 100.0, true).2);
+        let until = Utc::now() + chrono::Duration::minutes(2);
+        acct.state.lock().cooldowns.insert("gpt-6.1-sol".into(), until);
+        assert_eq!(acct.cooling_until("gpt-6.1-sol"), Some(until));
+        usage["credits"]["balance"] = "25".into();
+        usage["rate_limit"]["allowed"] = false.into();
+        assert!(!codex_polled_quota(&usage, 100.0, true).2);
     }
 
     #[test]
