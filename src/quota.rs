@@ -284,7 +284,20 @@ fn subscription_windows(v: &Value, ceiling: f64, credits: bool) -> Result<(Vec<W
         matches!(v["plan_type"].as_str(), Some("plus" | "pro")),
         "subscription-only mode requires a ChatGPT Plus or Pro plan"
     );
-    ensure!(v["rate_limit"]["allowed"] == true, "subscription allowance is unavailable");
+    // `allowed` describes included allowance, not credit eligibility. The
+    // provider sets it false at exhaustion even when credits remain available.
+    let exhausted_allowance = v["rate_limit"]["allowed"] == false
+        && v["rate_limit"]["limit_reached"] == true
+        && ["primary_window", "secondary_window"].iter().any(|key| {
+            let w = &v["rate_limit"][*key];
+            w["used_percent"].as_f64() == Some(100.0)
+                && w["limit_window_seconds"].as_i64().is_some_and(|s| s > 0)
+                && w["reset_at"].as_i64().and_then(ts).is_some_and(|r| r > Utc::now())
+        });
+    ensure!(
+        v["rate_limit"]["allowed"] == true || (credits && exhausted_allowance && credits_available(v)),
+        "subscription allowance is unavailable"
+    );
     let now = Utc::now();
     let strict = (|| -> Result<Vec<Window>> {
         let mut windows = checked_subscription_limit(&v["rate_limit"], "Codex", ceiling, now)?;
@@ -591,7 +604,19 @@ mod tests {
         assert_eq!(acct.cooling_until("gpt-6.1-sol"), Some(until));
         usage["credits"]["balance"] = "25".into();
         usage["rate_limit"]["allowed"] = false.into();
-        assert!(!codex_polled_quota(&usage, 100.0, true).2);
+        assert!(codex_polled_quota(&usage, 100.0, true).2);
+        assert!(subscription_windows(&usage, 100.0, true).unwrap().1);
+        assert!(subscription_windows(&usage, 100.0, false).is_err());
+        for (reached, used) in [(false, 100), (true, 20), (true, 101), (true, -1)] {
+            usage["rate_limit"]["limit_reached"] = reached.into();
+            usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
+            assert!(subscription_windows(&usage, 100.0, true).is_err());
+            assert!(!codex_polled_quota(&usage, 100.0, true).2);
+        }
+        usage["rate_limit"]["limit_reached"] = true.into();
+        usage["rate_limit"]["primary_window"]["used_percent"] = 100.into();
+        usage["rate_limit"]["primary_window"]["reset_at"] = (Utc::now().timestamp() - 1).into();
+        assert!(subscription_windows(&usage, 100.0, true).is_err());
     }
 
     #[test]
