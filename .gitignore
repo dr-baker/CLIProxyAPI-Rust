@@ -1,3 +1,5 @@
 /target
 /config.yaml
 /config.yaml.bak
+/agent_features/.worktrees/
+/.local/

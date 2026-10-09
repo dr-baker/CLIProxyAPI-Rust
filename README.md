@@ -4,13 +4,15 @@
 
 # CLIProxyAPI-Rust
 
+Daniel's maintained implementation: [dr-baker/CLIProxyAPI-Rust](https://github.com/dr-baker/CLIProxyAPI-Rust), branch `local-proxy`. Development and capture lifecycle changes land here. [The upstream project](https://github.com/IuCC123/CLIProxyAPI-Rust) remains a reference.
+
 **All your AI subscriptions. One fast API.**
 
 A single Rust binary that exposes OpenAI, Anthropic and Gemini compatible endpoints, backed by the accounts you already pay for:<br>
 Claude, ChatGPT, Gemini, Antigravity, Grok, Kimi, Meta, Devin and Vertex AI.<br>
 Point Claude Code, Codex, your editor or any SDK at one URL and stop caring which account answers.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/IuCC123/CLIProxyAPI-Rust/ci.yml?branch=main&style=flat-square&labelColor=000&label=ci)](https://github.com/IuCC123/CLIProxyAPI-Rust/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/dr-baker/CLIProxyAPI-Rust/ci.yml?branch=local-proxy&style=flat-square&labelColor=000&label=ci)](https://github.com/dr-baker/CLIProxyAPI-Rust/actions/workflows/ci.yml)
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-f4f4f5?style=flat-square&labelColor=000)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-f4f4f5?style=flat-square&labelColor=000&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Binary](https://img.shields.io/badge/single%20binary-~8%20MB-f4f4f5?style=flat-square&labelColor=000)](https://github.com/IuCC123/CLIProxyAPI-Rust/releases/latest)
@@ -39,13 +41,13 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 
 ## Quick start
 
-**1. Get the binary.** Download it for macOS, Linux or Windows from [Releases](https://github.com/IuCC123/CLIProxyAPI-Rust/releases/latest), or build it with Rust 1.88 or newer:
+**1. Build the maintained fork.** Use Rust 1.88 or newer:
 
 ```sh
-cargo install --git https://github.com/IuCC123/CLIProxyAPI-Rust
+cargo install --git https://github.com/dr-baker/CLIProxyAPI-Rust --branch local-proxy --locked
 ```
 
-Or run it with Docker (for amd64 and arm64):
+The upstream project also publishes [prebuilt releases](https://github.com/IuCC123/CLIProxyAPI-Rust/releases/latest) and Docker images (for amd64 and arm64). Those artifacts follow upstream's implementation:
 
 ```sh
 touch config.yaml && mkdir -p auths
