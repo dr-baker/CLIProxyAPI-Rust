@@ -1,11 +1,13 @@
 //! Bounded, local payload archive. Serialization and disk I/O run on one writer thread.
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use chrono::Utc;
+use capture_lifecycle::{CaptureChannel, CaptureLayout, CaptureRoot};
+use chrono::{NaiveDate, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -39,10 +41,33 @@ pub struct ArchiveStats {
 
 struct Job {
     path: PathBuf,
+    root: Root,
+    observed_day: NaiveDate,
     record: Value,
     bytes: usize,
     summary: bool,
 }
+
+struct CaptureHandle {
+    path: PathBuf,
+    producer: Mutex<CaptureRoot>,
+}
+
+type Root = Arc<CaptureHandle>;
+type Roots = Arc<Mutex<HashMap<PathBuf, Root>>>;
+
+/// Cleared only after the writer closure and its file handles have dropped,
+/// including thread unwinding and concurrent shutdown calls.
+struct RootLifetime(Roots);
+
+impl Drop for RootLifetime {
+    fn drop(&mut self) {
+        self.0.lock().clear();
+    }
+}
+
+/// A configuration validated before a management handler writes config.yaml.
+pub struct PreparedCapture(Option<Root>);
 
 struct Writer {
     sender: Option<mpsc::SyncSender<Job>>,
@@ -58,14 +83,16 @@ pub enum Admission {
 }
 
 pub struct Audit {
-    directory: RwLock<Option<PathBuf>>,
+    directory: RwLock<Option<Root>>,
+    roots: Roots,
     writer: Mutex<Writer>,
+    drain: Mutex<()>,
     stats: Arc<Mutex<ArchiveStats>>,
     limits: Limits,
 }
 
 impl Audit {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config) -> io::Result<Self> {
         let mut file = None;
         Self::with_writer(cfg, LIMITS, move |job| write_job(job, &mut file))
     }
@@ -73,15 +100,30 @@ impl Audit {
     fn with_writer(
         cfg: &Config,
         limits: Limits,
-        mut write: impl FnMut(&Job) -> io::Result<()> + Send + 'static,
-    ) -> Self {
+        write: impl FnMut(&Job) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Self> {
+        let roots = Arc::new(Mutex::new(HashMap::new()));
+        let directory = Self::prepare(&roots, cfg)?;
+        if let Some(root) = &directory.0 {
+            roots.lock().insert(root.path.clone(), root.clone());
+        }
+        let worker_roots = roots.clone();
         let stats = Arc::new(Mutex::new(ArchiveStats::default()));
         let worker_stats = stats.clone();
         let (sender, receiver) = mpsc::sync_channel::<Job>(limits.records);
         let handle = std::thread::Builder::new().name("proxy-archive".into()).spawn(move || {
+            let lifetime = RootLifetime(worker_roots);
+            // Locals drop in reverse order during unwinding. The write closure
+            // closes its file handles before RootLifetime releases the guards.
+            let mut write = write;
             let mut reported = (0, 0, 0);
-            for job in receiver {
-                let result = write(&job);
+            for mut job in receiver {
+                // Resolve when writing, so clock rollback and old queued jobs
+                // cannot reopen a path below this root's durable day floor.
+                let result = (|| {
+                    job.path = job.root.producer.lock().resolve(job.observed_day, CaptureChannel::Proxy)?;
+                    write(&job)
+                })();
                 let bytes = job.bytes;
                 // Release the payload before releasing its memory reservation.
                 drop(job);
@@ -111,18 +153,23 @@ impl Audit {
                         os_error = ?snapshot.last_os_error, "local archive coverage is incomplete");
                 }
             }
-        });
-        let writer = match handle {
-            Ok(handle) => Writer { sender: Some(sender), handle: Some(handle) },
-            Err(_) => {
-                stats.lock().write_errors += 1;
-                Writer { sender: None, handle: None }
-            }
-        };
-        Self { directory: RwLock::new(Self::path(cfg)), writer: Mutex::new(writer), stats, limits }
+            // Close the current BufWriter before releasing any previous roots.
+            // This order also holds when the Audit owner drops without joining.
+            drop(write);
+            drop(lifetime);
+        })?;
+        let writer = Writer { sender: Some(sender), handle: Some(handle) };
+        Ok(Self {
+            directory: RwLock::new(directory.0),
+            roots,
+            writer: Mutex::new(writer),
+            drain: Mutex::new(()),
+            stats,
+            limits,
+        })
     }
 
-    fn path(cfg: &Config) -> Option<PathBuf> {
+    pub fn path(cfg: &Config) -> Option<PathBuf> {
         if !cfg.request_log {
             return None;
         }
@@ -134,8 +181,45 @@ impl Audit {
         })
     }
 
-    pub fn configure(&self, cfg: &Config) {
-        *self.directory.write() = Self::path(cfg);
+    fn prepare(roots: &Roots, cfg: &Config) -> io::Result<PreparedCapture> {
+        let Some(path) = Self::path(cfg) else { return Ok(PreparedCapture(None)) };
+        if std::fs::symlink_metadata(&path)?.is_symlink() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "capture root must be a real directory"));
+        }
+        let canonical = std::fs::canonicalize(&path)?;
+        let retained = roots.lock().get(&canonical).cloned();
+        let root = match retained {
+            Some(root) => root,
+            None => Arc::new(CaptureHandle {
+                path: canonical.clone(),
+                producer: Mutex::new(CaptureRoot::open(&path, CaptureLayout::Proxy)?),
+            }),
+        };
+        Ok(PreparedCapture(Some(root)))
+    }
+
+    pub fn prepare_configuration(&self, cfg: &Config) -> io::Result<PreparedCapture> {
+        if self.writer.lock().sender.is_none() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "archive writer is closed"));
+        }
+        Self::prepare(&self.roots, cfg)
+    }
+
+    pub fn apply_configuration(&self, prepared: PreparedCapture) -> io::Result<()> {
+        let writer = self.writer.lock();
+        if writer.sender.is_none() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "archive writer is closed"));
+        }
+        if let Some(root) = &prepared.0 {
+            self.roots.lock().insert(root.path.clone(), root.clone());
+        }
+        *self.directory.write() = prepared.0;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn configure(&self, cfg: &Config) -> io::Result<()> {
+        self.apply_configuration(self.prepare_configuration(cfg)?)
     }
 
     pub fn stats(&self) -> ArchiveStats {
@@ -147,12 +231,18 @@ impl Audit {
     /// Budget includes the record being written. Payloads leave reserved space for
     /// summaries; overload and oversized records produce observable coverage loss.
     pub fn record(&self, request_id: u64, direction: &str, transport: &str, data: Value) -> io::Result<Admission> {
-        let Some(directory) = self.directory.read().clone() else {
+        let root = self.directory.read().clone();
+        let Some(root) = root else {
+            if self.writer.lock().sender.is_none() {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "archive writer is closed"));
+            }
             return Ok(Admission::Disabled);
         };
         let summary = direction == "summary";
         let now = Utc::now();
-        let path = directory.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
+        // Budget only the path length here. Root resolution and filesystem work
+        // stay on the writer thread.
+        let path = root.path.join(format!("rust-{}.jsonl", now.format("%Y-%m-%d")));
         let record = json!({ "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             "process_id": std::process::id(), "request_id": request_id,
             "direction": direction, "transport": transport, "data": data });
@@ -177,7 +267,7 @@ impl Audit {
         stats.pending_bytes += bytes;
         // The writer lock orders admissions; the budget lock prevents the worker
         // releasing a reservation until try_send has either accepted or rolled back.
-        match sender.try_send(Job { path, record, bytes, summary }) {
+        match sender.try_send(Job { path, root, observed_day: now.date_naive(), record, bytes, summary }) {
             Ok(()) => Ok(Admission::Queued),
             Err(_) => {
                 stats.pending_records -= 1;
@@ -190,9 +280,11 @@ impl Audit {
 
     /// Close admission and drain accepted records. Call off async request workers.
     pub fn shutdown(&self) -> io::Result<()> {
+        let _drain = self.drain.lock();
         let handle = {
             let mut writer = self.writer.lock();
             writer.sender.take();
+            self.directory.write().take();
             writer.handle.take()
         };
         if let Some(handle) = handle {
@@ -258,15 +350,11 @@ fn write_job(job: &Job, current: &mut Option<(PathBuf, BufWriter<File>)>) -> io:
         if let Some((_, file)) = current {
             file.flush()?;
         }
-        std::fs::create_dir_all(job.path.parent().unwrap())?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        let (path, file) = job.root.producer.lock().open_append(job.observed_day, CaptureChannel::Proxy)?;
+        if path != job.path {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "capture storage day changed before append"));
         }
-        *current = Some((job.path.clone(), BufWriter::with_capacity(64 << 10, options.open(&job.path)?)));
+        *current = Some((path, BufWriter::with_capacity(64 << 10, file)));
     }
     let file = &mut current.as_mut().unwrap().1;
     let result = (|| {

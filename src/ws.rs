@@ -1289,7 +1289,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("cliproxy-idle-admission-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let config = Config { auth_dir: directory.to_string_lossy().into(), ..Default::default() };
-        (App::new(config, directory.join("config.yaml")), directory)
+        (App::new(config, directory.join("config.yaml")).unwrap(), directory)
     }
 
     #[tokio::test]
@@ -1378,7 +1378,8 @@ mod io_tests {
         let app = App::new(
             Config { auth_dir: "/nonexistent".into(), ..Default::default() },
             "/nonexistent/config.yaml".into(),
-        );
+        )
+        .unwrap();
         let mut sess = Session {
             upstream: Some((acct, up)),
             upstream_ids: VecDeque::from(["prior-response".into()]),

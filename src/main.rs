@@ -66,26 +66,86 @@ enum Cmd {
     /// Show what the config and auth directory contain, without starting the server.
     /// Handy before switching from CLIProxyAPI.
     Check,
+    /// Explicitly enroll capture roots or seal closed daily files while offline.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArchiveCommand {
+    /// Adopt a capture directory after stopping and draining every legacy writer.
+    Enroll {
+        #[arg(long)]
+        directory: PathBuf,
+    },
+    /// Publish closure receipts. Retains the latest file pairs and hot days.
+    Seal {
+        #[arg(long)]
+        directory: PathBuf,
+        /// Only storage days earlier than YYYY-MM-DD qualify.
+        #[arg(long, value_parser = capture_day)]
+        before: chrono::NaiveDate,
+        #[arg(long, default_value_t = 2)]
+        keep_latest: usize,
+        /// Restrict hashing to these relative paths; reader exclusions still apply.
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+    },
+}
+
+fn capture_day(value: &str) -> std::result::Result<chrono::NaiveDate, String> {
+    let day = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| "expected YYYY-MM-DD".to_owned())?;
+    if day.to_string() != value || value.len() != 10 || value.starts_with("0000") {
+        return Err("expected a canonical positive YYYY-MM-DD date".into());
+    }
+    Ok(day)
+}
+
+fn archive(command: ArchiveCommand) -> Result<()> {
+    use capture_lifecycle::{CaptureLayout, SealOptions, enroll, seal_offline};
+    let report = match command {
+        ArchiveCommand::Enroll { directory } => {
+            serde_json::to_value(enroll(directory, CaptureLayout::Proxy, chrono::Utc::now().date_naive())?)?
+        }
+        ArchiveCommand::Seal { directory, before, keep_latest, files } => {
+            let mut options = SealOptions::new(CaptureLayout::Proxy, before);
+            options.keep_latest = keep_latest;
+            if !files.is_empty() {
+                options.only_relative_paths = Some(files);
+            }
+            serde_json::to_value(seal_offline(directory, options)?)?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // CLIProxyAPI's Go-style flags (-config, -claude-login, ...) work too.
     let cli = Cli::parse_from(compat::translate_args(std::env::args().collect()));
-    if matches!(cli.cmd, Some(Cmd::Check)) {
-        return check(&cli.config);
-    }
-    let cfg = Config::load(&cli.config)?;
+    let command = match cli.cmd.unwrap_or(Cmd::Serve) {
+        Cmd::Check => return check(&cli.config),
+        Cmd::Archive { command } => return archive(command),
+        command => command,
+    };
+    let mut cfg = Config::load(&cli.config)?;
     let filter = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| if cfg.debug { "cliproxyapi_rust=debug".into() } else { "cliproxyapi_rust=info".into() });
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).compact().init();
     std::fs::create_dir_all(cfg.auth_dir()).ok();
 
-    let app = App::new(cfg, cli.config.clone());
-    match cli.cmd {
-        Some(Cmd::Login { provider, no_browser, file, location }) => {
-            login(app, &provider, no_browser, file, &location).await
-        }
+    // A separate sign-in command does not produce proxy captures and can run
+    // while the serving process owns the capture-root lock.
+    if matches!(command, Cmd::Login { .. }) {
+        cfg.request_log = false;
+    }
+    let app = App::new(cfg, cli.config.clone())
+        .context("initializing capture; stop duplicate producers and explicitly enroll any new request-log-dir with archive enroll")?;
+    match command {
+        Cmd::Login { provider, no_browser, file, location } => login(app, &provider, no_browser, file, &location).await,
         _ => serve(app).await,
     }
 }
@@ -199,10 +259,10 @@ async fn watch(app: Arc<App>) {
         if t != cfg_time {
             cfg_time = t;
             match std::fs::read_to_string(&app.cfg_path).map_err(anyhow::Error::from).and_then(|s| Config::parse(&s)) {
-                Ok(cfg) => {
-                    tracing::info!("config reloaded");
-                    app.set_config(cfg);
-                }
+                Ok(cfg) => match app.set_config(cfg) {
+                    Ok(()) => tracing::info!("config reloaded"),
+                    Err(e) => tracing::error!("config not reloaded: capture guard rejected the configuration: {e}"),
+                },
                 Err(e) => tracing::error!("config not reloaded: {e:#}"),
             }
         }

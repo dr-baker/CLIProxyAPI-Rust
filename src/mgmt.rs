@@ -571,6 +571,10 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
+    let capture = match app.audit.prepare_configuration(&cfg) {
+        Ok(capture) => capture,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("capture configuration rejected: {e}")),
+    };
     // Rewriting drops YAML comments; keep the original once.
     let backup = app.cfg_path.with_extension("yaml.bak");
     if text.contains('#') && !backup.exists() {
@@ -579,7 +583,9 @@ fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Res
     if let Err(e) = std::fs::write(&app.cfg_path, out) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    app.set_config(cfg);
+    if let Err(e) = app.set_prepared_config(cfg, capture) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("config not applied: {e}"));
+    }
     ok()
 }
 
@@ -599,11 +605,17 @@ async fn put_config(State(app): State<Arc<App>>, Json(b): Json<ConfigBody>) -> R
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     let old = app.cfg();
+    let capture = match app.audit.prepare_configuration(&cfg) {
+        Ok(capture) => capture,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("capture configuration rejected: {e}")),
+    };
     if let Err(e) = std::fs::write(&app.cfg_path, &b.text) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     let restart = cfg.host != old.host || cfg.port != old.port;
-    app.set_config(cfg);
+    if let Err(e) = app.set_prepared_config(cfg, capture) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("config not applied: {e}"));
+    }
     Json(json!({ "ok": true, "restart_required": restart })).into_response()
 }
 
@@ -683,5 +695,23 @@ mod tests {
         assert!(!management_key_matches("wrong", &hash));
         assert!(management_key_matches("plain", "plain"));
         assert!(!management_key_matches("plain", "other"));
+    }
+
+    #[tokio::test]
+    async fn config_updates_validate_capture_before_replacing_the_config_file() {
+        let dir = std::env::temp_dir().join(format!("cliproxy-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let original = "request-log: false\n";
+        std::fs::write(&path, original).unwrap();
+        let app = App::new(Config { auth_dir: "/nonexistent".into(), ..Default::default() }, path.clone()).unwrap();
+        let invalid = format!("request-log: true\nrequest-log-dir: {}\n", dir.join("unenrolled").display());
+        let response = put_config(State(app.clone()), Json(ConfigBody { text: invalid })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!app.cfg().request_log);
+        assert!(!dir.join("unenrolled").exists());
+        app.audit.shutdown().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

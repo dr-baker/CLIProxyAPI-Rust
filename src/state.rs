@@ -29,12 +29,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, cfg_path: PathBuf) -> Arc<Self> {
+    pub fn new(cfg: Config, cfg_path: PathBuf) -> std::io::Result<Arc<Self>> {
+        // Capture must obtain its enrolled root guard before account loading or
+        // starting a server whose health would otherwise mask missing coverage.
+        let audit = crate::audit::Audit::new(&cfg)?;
         let pool = Pool::default();
         pool.reload(&cfg);
         let (live, _) = broadcast::channel(512);
-        Arc::new(Self {
-            audit: crate::audit::Audit::new(&cfg),
+        Ok(Arc::new(Self {
+            audit,
             http: Http::new(&cfg.proxy_url),
             cfg: ArcSwap::from_pointee(cfg),
             cfg_path,
@@ -44,19 +47,25 @@ impl App {
             started: Utc::now(),
             live,
             quiet_until: AtomicI64::new(0),
-        })
+        }))
     }
 
     pub fn cfg(&self) -> Arc<Config> {
         self.cfg.load_full()
     }
 
-    pub fn set_config(&self, cfg: Config) {
-        self.audit.configure(&cfg);
+    pub fn set_config(&self, cfg: Config) -> std::io::Result<()> {
+        let capture = self.audit.prepare_configuration(&cfg)?;
+        self.set_prepared_config(cfg, capture)
+    }
+
+    pub fn set_prepared_config(&self, cfg: Config, capture: crate::audit::PreparedCapture) -> std::io::Result<()> {
+        self.audit.apply_configuration(capture)?;
         self.http.set_default_proxy(&cfg.proxy_url);
         self.pool.reload(&cfg);
         self.cfg.store(Arc::new(cfg));
         self.broadcast("accounts", serde_json::Value::Null);
+        Ok(())
     }
 
     pub fn reload_accounts(&self) {
