@@ -434,6 +434,11 @@ mod tests {
 
     #[test]
     fn subscription_blocks_at_ceiling_and_rejects_invalid_windows() {
+        for (used, allowed) in [(90.0, true), (99.9, true), (100.0, false)] {
+            let mut usage = subscription_usage();
+            usage["rate_limit"]["primary_window"]["used_percent"] = used.into();
+            assert_eq!(subscription_windows(&usage, 100.0).is_ok(), allowed);
+        }
         for used in [90.0, 99.0, 100.0, -1.0, 101.0] {
             let mut usage = subscription_usage();
             usage["rate_limit"]["primary_window"]["used_percent"] = used.into();

@@ -838,7 +838,7 @@ async fn native_turn(
     for admission in 0..2 {
         let allowance = while_idle(app, sess, crate::quota::require_subscription(app, &acct, &upstream_model)).await;
         if let Err(error) = allowance {
-            let message = error.to_string();
+            let message = format!("{error:#}");
             sess.close_upstream("subscription_rejected").await;
             tracker.finish(403, &Usage::default(), Some(message.clone()));
             return Native::Error(
