@@ -4,6 +4,7 @@
 //! All producers of a root must honor this protocol; legacy writers must stop first.
 
 mod files;
+mod retire;
 mod seal;
 mod state;
 
@@ -15,6 +16,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use retire::{CaptureRetirementV1, read_retirement, retire_offline};
 pub use seal::{
     CaptureSealV1, FileIdentity, SealOptions, SealReport, SealSkip, SealSkipReason, read_seal, seal_offline,
 };
@@ -23,6 +25,7 @@ pub use state::Enrollment;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const ROOT_MARKER: &str = ".capture-root.json";
 pub const STATE_DIRECTORY: &str = ".capture-state";
+pub const RETIREMENT_FILE: &str = "retired.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +83,14 @@ impl CaptureRoot {
     /// Open an explicitly enrolled root. Lock contention, missing initialized
     /// metadata, malformed state, and inconsistent receipts are errors.
     pub fn open(root: impl AsRef<Path>, layout: CaptureLayout) -> io::Result<Self> {
+        let producer = Self::open_for_maintenance(root, layout)?;
+        if producer.state.retirement.is_some() {
+            return Err(files::invalid("capture root is permanently retired; use a new enrolled root"));
+        }
+        Ok(producer)
+    }
+
+    fn open_for_maintenance(root: impl AsRef<Path>, layout: CaptureLayout) -> io::Result<Self> {
         let root = files::existing_root(root.as_ref())?;
         let lock = files::lock_root(&root, false)?;
         files::recover_staging(&root)?;
@@ -109,6 +120,9 @@ impl CaptureRoot {
         files::validate_day(observed_day)?;
         if self.poisoned {
             return Err(files::invalid("capture root is unavailable after a failed state transition"));
+        }
+        if self.state.retirement.is_some() {
+            return Err(files::invalid("capture root is permanently retired; use a new enrolled root"));
         }
         if channel.layout() != self.state.layout {
             return Err(files::invalid("capture channel does not match the enrolled layout"));

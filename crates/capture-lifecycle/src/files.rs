@@ -11,7 +11,7 @@ use crate::STATE_DIRECTORY;
 mod capture;
 #[cfg(all(test, unix))]
 pub(crate) use capture::BEFORE_APPEND_LEAF;
-pub(crate) use capture::{CaptureParent, Fingerprint, fingerprint};
+pub(crate) use capture::{CaptureParent, Fingerprint, fingerprint, identity};
 
 pub(crate) const MAX_METADATA_BYTES: u64 = 64 << 10;
 pub(crate) const MAX_ENTRIES: usize = 100_000;

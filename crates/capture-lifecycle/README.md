@@ -6,7 +6,7 @@
 
 `enroll(root, layout, initial_day)` explicitly adopts a directory. Stop and drain every legacy producer first. Older binaries ignore this protocol and its advisory lock.
 
-`CaptureRoot::open(root, layout)` requires valid enrollment and takes an exclusive, nonblocking lock on `.capture-state/producer.lock`. Missing or malformed initialized metadata, a missing permanent lock file, mismatched layouts, and lock contention are errors. Repeated enrollment preserves the original root UUID and never lowers the capture day floor.
+`CaptureRoot::open(root, layout)` requires valid enrollment and takes an exclusive, nonblocking lock on `.capture-state/producer.lock`. Missing or malformed initialized metadata, a missing permanent lock file, mismatched layouts, retirement, and lock contention are errors. Repeated enrollment preserves the original root UUID and never lowers the capture day floor. Enrollment cannot reopen a retired root.
 
 Keep `CaptureRoot` alive until every queued write and every open capture handle has closed. A producer that supports config reloads must retain guards for previous capture directories until their writers finish. A root UUID identifies persistent storage. It does not identify a process.
 
@@ -33,7 +33,9 @@ Unix capture files have mode `0600`. Newly enrolled roots and capture subdirecto
 - Files in the active storage day or any later day.
 - Files on or after the exclusive `before` boundary.
 
-`keep_latest` and `hot_days` must each be at least two. `only_relative_paths` optionally narrows the selected files while preserving every root-wide exclusion. Selected paths must match the enrolled layout. Missing selected sources are errors. Protected selected files appear in `SealReport.skipped` and are not hashed.
+`keep_latest` and `hot_days` must each be at least two. `only_relative_paths` optionally narrows the selected files while preserving every active root's exclusion. Selected paths must match the enrolled layout. Missing selected sources are errors. Protected selected files appear in `SealReport.skipped` and are not hashed.
+
+For a permanently retired root, sealing omits the latest-file and hot-window exclusions. The retirement operation first advances the floor beyond every discovered capture day. The explicit `before` boundary still applies. Partial final lines remain raw and unsealed. Retirement alone grants no archive deletion permission.
 
 The operation advances the day floor before it hashes any selected source or publishes a receipt. A future producer cannot open those older paths through this crate, even if the source is later removed. Discovery records each source and parent identity, length, and change timestamps. Sealing revalidates that snapshot before reading any payload, streams SHA-256 with a 64 KiB buffer, syncs the source, and checks the snapshot again after reading. A replaced or newly touched source requires a fresh run with fresh reader exclusions. An empty file qualifies. A nonempty file must end in a newline. Partial tails remain untouched and have no seal.
 
@@ -61,6 +63,18 @@ The root marker binds protocol version, root UUID, and layout. The state adds `c
 `read_seal(root, relative_path)` validates the receipt against the current root marker and state. It checks protocol, UUID, layout, canonical path, channel, digest format, and day floor. It works after raw source retirement and does not read payloads. It does not prove archive recovery or equality with a current source file. Archive consumers must compare the full source identity, length, and digest with their verified checkpoint before any optional retirement.
 
 Metadata reads are capped at 64 KiB each. Directory scans and selections are capped at 100,000 entries. Cold-path ancestor walks are capped at 128 directories. Source hashing has no payload-size limit and uses bounded memory. Sealing can require time proportional to the selected source bytes.
+
+## Permanent root retirement
+
+`retire_offline(root, layout)` requires an enrolled root with every producer stopped and drained. It takes the permanent producer lock and publishes a `CaptureRetirementV1`. That receipt binds protocol, layout, root UUID, directory device and inode, retirement UUID, final day floor, and UTC retirement time. It never changes captured bytes or removes a source file.
+
+The operation publishes the retirement intent in `state.json` first, then `.capture-root.json`, then the immutable `.capture-state/retired.json` receipt. Each publication syncs its parent directory. It holds directory handles and revalidates the root, state directory, and producer lock before and after publication. A successful result also resyncs the lifecycle directories and their bounded ancestor chain.
+
+Any published intent blocks producer startup and explicit enrollment. Prior lifecycle producers reject the extra state field through their strict schema. An interrupted retirement can resume with the same UUID and directory identity. It cannot reopen capture. A new enrolled directory is required for future capture. There is no unretire operation.
+
+`read_retirement(root)` returns `None` for valid active metadata or the complete retirement receipt. Missing, corrupt, mismatched, or copied retirement metadata is an error. State, root marker, immutable receipt, and current directory identity must agree. Keep all lifecycle metadata after raw file removal. Existing per-file seals and removal receipts retain their original content.
+
+Permanent retirement allows an archive consumer to reconsider recent-file reader exclusions. The consumer must still opt that named source into archive-backed readers and prove exact source recovery before removal. A retired root with an incomplete JSONL tail remains a backfill blocker; this crate preserves the tail and refuses a seal.
 
 ## Platform and trust limits
 

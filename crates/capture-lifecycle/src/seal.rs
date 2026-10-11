@@ -108,7 +108,8 @@ pub fn seal_offline(root: impl AsRef<Path>, options: SealOptions) -> io::Result<
     if options.keep_latest < 2 || options.keep_latest > files::MAX_ENTRIES || options.hot_days < 2 {
         return Err(files::invalid("seal must preserve at least two latest files and two hot days"));
     }
-    let mut producer = CaptureRoot::open(root, options.layout)?;
+    let mut producer = CaptureRoot::open_for_maintenance(root, options.layout)?;
+    let permanently_retired = producer.state.retirement.is_some();
     let only = if let Some(paths) = &options.only_relative_paths {
         if paths.is_empty() || paths.len() > files::MAX_ENTRIES {
             return Err(files::invalid("seal path selection must be nonempty and bounded"));
@@ -149,11 +150,13 @@ pub fn seal_offline(root: impl AsRef<Path>, options: SealOptions) -> io::Result<
             Some(SealSkipReason::BeforeBoundary)
         } else if candidate.day >= active {
             Some(SealSkipReason::ActiveDay)
-        } else if by_name.contains(&candidate.relative) {
+        } else if !permanently_retired && by_name.contains(&candidate.relative) {
             Some(SealSkipReason::RecentFilename)
-        } else if by_mtime.contains(&candidate.relative) {
+        } else if !permanently_retired && by_mtime.contains(&candidate.relative) {
             Some(SealSkipReason::RecentMtime)
-        } else if candidate.day >= cutoff.date_naive() || candidate.fingerprint.modified >= cutoff_time {
+        } else if !permanently_retired
+            && (candidate.day >= cutoff.date_naive() || candidate.fingerprint.modified >= cutoff_time)
+        {
             Some(SealSkipReason::Hot)
         } else {
             None
@@ -326,6 +329,17 @@ fn discover(root: &Path, layout: CaptureLayout) -> io::Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
+pub(crate) fn closed_root_floor(root: &Path, layout: CaptureLayout, existing: NaiveDate) -> io::Result<NaiveDate> {
+    let latest = discover(root, layout)?.into_iter().map(|candidate| candidate.day).max();
+    if let Some(latest) = latest {
+        let after = latest.succ_opt().ok_or_else(|| files::invalid("retired capture day has no successor"))?;
+        files::validate_day(after)?;
+        Ok(existing.max(after))
+    } else {
+        Ok(existing)
+    }
+}
+
 fn add_candidate(
     root: &Path,
     relative: PathBuf,
@@ -368,7 +382,7 @@ struct Snapshot {
     newline: bool,
 }
 
-fn require_identity_support() -> io::Result<()> {
+pub(crate) fn require_identity_support() -> io::Result<()> {
     if cfg!(unix) {
         Ok(())
     } else {

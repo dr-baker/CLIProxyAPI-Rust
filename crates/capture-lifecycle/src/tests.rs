@@ -176,6 +176,224 @@ fn missing_permanent_lock_cannot_be_recreated_on_an_initialized_root() {
 
 #[cfg(unix)]
 #[test]
+fn permanent_retirement_requires_exclusive_ownership_and_never_reopens_capture() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-02");
+    temp.write("rust-2026-10-10.jsonl", b"{\"sequence\":1}\n");
+    let producer = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    assert!(retire_offline(&temp.0, CaptureLayout::Proxy).is_err());
+    drop(producer);
+    let retired = retire_offline(&temp.0, CaptureLayout::Proxy).unwrap();
+    assert_eq!(retired.capture_day_floor, day("2026-10-11"));
+    assert_eq!(read_retirement(&temp.0).unwrap(), Some(retired.clone()));
+    assert_eq!(retire_offline(&temp.0, CaptureLayout::Proxy).unwrap(), retired);
+    assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_err());
+    assert!(enroll(&temp.0, CaptureLayout::Proxy, day("2026-10-12")).is_err());
+    assert!(retire_offline(&temp.0, CaptureLayout::Otel).is_err());
+    assert_eq!(fs::read(temp.0.join("rust-2026-10-10.jsonl")).unwrap(), b"{\"sequence\":1}\n");
+    let active = Temp::enrolled(CaptureLayout::Proxy, "2026-10-11");
+    assert!(CaptureRoot::open(&active.0, CaptureLayout::Proxy).is_ok());
+    assert!(read_retirement(&active.0).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn retired_roots_seal_recent_files_but_preserve_partial_tails_and_boundaries() {
+    for layout in [CaptureLayout::Proxy, CaptureLayout::Otel] {
+        let temp = Temp::enrolled(layout, "2026-10-10");
+        let names = if layout == CaptureLayout::Proxy {
+            ["rust-2026-10-09.jsonl", "rust-2026-10-10.jsonl", "rust-2026-10-11.jsonl"]
+        } else {
+            ["2026-10-09/logs.jsonl", "2026-10-10/traces.jsonl", "2026-10-11/metrics.jsonl"]
+        };
+        for name in names {
+            temp.write(name, b"{}\n");
+            File::options()
+                .write(true)
+                .open(temp.0.join(name))
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(SystemTime::now()))
+                .unwrap();
+        }
+        temp.write(
+            if layout == CaptureLayout::Proxy { "rust-2026-10-08.jsonl" } else { "2026-10-08/logs.jsonl" },
+            b"{\"partial\":",
+        );
+        let retired = retire_offline(&temp.0, layout).unwrap();
+        let mut options = options(layout);
+        options.before = day("2026-10-11");
+        let report = seal_offline(&temp.0, options).unwrap();
+        assert_eq!(report.sealed.len(), 2);
+        assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::BeforeBoundary));
+        assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::PartialTail));
+        for name in &names[..2] {
+            let seal = read_seal(&temp.0, name).unwrap();
+            assert_eq!(seal.root_uuid, retired.root_uuid);
+            assert_eq!(seal.sha256, hex::encode(Sha256::digest(b"{}\n")));
+            assert_eq!(seal.closed_length, 3);
+        }
+        assert_eq!(read_retirement(&temp.0).unwrap(), Some(retired));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_publication_failures_stay_closed_and_resume_original_identity() {
+    for stage in ["intent", "marker", "receipt"] {
+        let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+        temp.write("rust-2026-10-10.jsonl", b"{}\n");
+        match stage {
+            "intent" => files::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true)),
+            "marker" => files::FAIL_DIRECTORY_SYNC.with(|failure| *failure.borrow_mut() = Some(temp.0.clone())),
+            "receipt" => retire::AFTER_MARKER.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| {
+                    files::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
+                }))
+            }),
+            _ => unreachable!(),
+        }
+        assert!(retire_offline(&temp.0, CaptureLayout::Proxy).is_err(), "{stage}");
+        let state: state::RootState = files::read_json(&temp.state_path()).unwrap();
+        let intent = state.retirement.unwrap();
+        assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_err(), "{stage}");
+        assert!(enroll(&temp.0, CaptureLayout::Proxy, day("2026-10-12")).is_err(), "{stage}");
+        assert_eq!(retire_offline(&temp.0, CaptureLayout::Proxy).unwrap(), intent, "{stage}");
+        assert_eq!(read_retirement(&temp.0).unwrap(), Some(intent), "{stage}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retired_metadata_is_fail_closed_for_missing_corrupt_or_conflicting_records() {
+    for target in [ROOT_MARKER, ".capture-state/state.json", ".capture-state/retired.json"] {
+        for mutation in ["missing", "malformed", "uuid", "directory"] {
+            let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+            retire_offline(&temp.0, CaptureLayout::Proxy).unwrap();
+            let path = temp.0.join(target);
+            if mutation == "missing" {
+                fs::remove_file(&path).unwrap();
+            } else if mutation == "malformed" {
+                fs::write(&path, b"null\n").unwrap();
+            } else {
+                let mut value: Value = files::read_json(&path).unwrap();
+                let retirement = if target.ends_with(RETIREMENT_FILE) { &mut value } else { &mut value["retirement"] };
+                if mutation == "uuid" {
+                    retirement["retirement_uuid"] = json!(Uuid::new_v4());
+                } else {
+                    retirement["identity"]["inode"] = json!(0);
+                }
+                fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_err(), "{target}:{mutation}");
+            assert!(read_retirement(&temp.0).is_err(), "{target}:{mutation}");
+            assert!(enroll(&temp.0, CaptureLayout::Proxy, day("2026-10-11")).is_err(), "{target}:{mutation}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_rejects_root_state_or_lock_replacement_after_exclusive_acquisition() {
+    for replacement in ["root", "state", "lock"] {
+        let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+        let root = temp.0.clone();
+        let saved = root.with_extension("previous");
+        let producer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder = producer.clone();
+        let saved_for_hook = saved.clone();
+        retire::AFTER_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                match replacement {
+                    "root" => {
+                        fs::rename(&root, &saved_for_hook).unwrap();
+                        fs::create_dir(&root).unwrap();
+                        fs::create_dir(root.join(STATE_DIRECTORY)).unwrap();
+                        fs::create_dir(root.join(STATE_DIRECTORY).join("seals")).unwrap();
+                        for relative in [ROOT_MARKER, ".capture-state/state.json", ".capture-state/producer.lock"] {
+                            fs::copy(saved_for_hook.join(relative), root.join(relative)).unwrap();
+                        }
+                    }
+                    "state" => {
+                        let old = root.join(".capture-state-previous");
+                        fs::rename(root.join(STATE_DIRECTORY), &old).unwrap();
+                        fs::create_dir(root.join(STATE_DIRECTORY)).unwrap();
+                        fs::create_dir(root.join(STATE_DIRECTORY).join("seals")).unwrap();
+                        for relative in ["state.json", "producer.lock"] {
+                            fs::copy(old.join(relative), root.join(STATE_DIRECTORY).join(relative)).unwrap();
+                        }
+                    }
+                    "lock" => {
+                        let lock = root.join(STATE_DIRECTORY).join("producer.lock");
+                        fs::rename(&lock, lock.with_extension("previous")).unwrap();
+                        fs::write(&lock, b"").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                *holder.borrow_mut() = Some(CaptureRoot::open(&root, CaptureLayout::Proxy).unwrap());
+            }))
+        });
+        let failure = retire_offline(&temp.0, CaptureLayout::Proxy).unwrap_err();
+        assert!(failure.to_string().contains("changed during retirement"), "{replacement}: {failure}");
+        assert!(read_retirement(&temp.0).unwrap().is_none(), "{replacement}");
+        let state: state::RootState = files::read_json(&temp.state_path()).unwrap();
+        assert!(state.retirement.is_none(), "{replacement}");
+        drop(producer.borrow_mut().take());
+        if saved.exists() {
+            fs::remove_dir_all(saved).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retired_root_directory_replacement_cannot_reuse_the_original_proof() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    retire_offline(&temp.0, CaptureLayout::Proxy).unwrap();
+    let moved = temp.0.with_extension("moved");
+    fs::rename(&temp.0, &moved).unwrap();
+    fs::create_dir(&temp.0).unwrap();
+    fs::create_dir(temp.0.join(STATE_DIRECTORY)).unwrap();
+    fs::create_dir(temp.0.join(STATE_DIRECTORY).join("seals")).unwrap();
+    for relative in
+        [ROOT_MARKER, ".capture-state/state.json", ".capture-state/retired.json", ".capture-state/producer.lock"]
+    {
+        fs::copy(moved.join(relative), temp.0.join(relative)).unwrap();
+    }
+    assert!(read_retirement(&temp.0).is_err());
+    assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_err());
+    assert!(retire_offline(&temp.0, CaptureLayout::Proxy).is_err());
+    fs::remove_dir_all(moved).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn original_producer_schema_rejects_permanent_retirement_state_and_marker() {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OriginalState {
+        protocol_version: u32,
+        root_uuid: Uuid,
+        layout: CaptureLayout,
+        capture_day_floor: NaiveDate,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OriginalMarker {
+        protocol_version: u32,
+        root_uuid: Uuid,
+        layout: CaptureLayout,
+    }
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    assert!(files::read_json::<OriginalState>(&temp.state_path()).is_ok());
+    assert!(files::read_json::<OriginalMarker>(&temp.0.join(ROOT_MARKER)).is_ok());
+    retire_offline(&temp.0, CaptureLayout::Proxy).unwrap();
+    assert!(files::read_json::<OriginalState>(&temp.state_path()).is_err());
+    assert!(files::read_json::<OriginalMarker>(&temp.0.join(ROOT_MARKER)).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn stale_metadata_publication_link_recovers_without_resetting_root() {
     let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-02");
     let original: state::RootState = files::read_json(&temp.state_path()).unwrap();
