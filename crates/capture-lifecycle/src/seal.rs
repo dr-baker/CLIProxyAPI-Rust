@@ -134,7 +134,11 @@ pub fn seal_offline(root: impl AsRef<Path>, options: SealOptions) -> io::Result<
     }
     let by_name = newest(&candidates, options.layout, options.keep_latest, false);
     let by_mtime = newest(&candidates, options.layout, options.keep_latest, true);
-    let active = producer.state.capture_day_floor.max(options.now.date_naive());
+    let active = if permanently_retired {
+        producer.state.capture_day_floor
+    } else {
+        producer.state.capture_day_floor.max(options.now.date_naive())
+    };
     let cutoff = options
         .now
         .checked_sub_signed(Duration::days(i64::from(options.hot_days)))

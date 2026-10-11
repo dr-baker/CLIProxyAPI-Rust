@@ -237,6 +237,33 @@ fn retired_roots_seal_recent_files_but_preserve_partial_tails_and_boundaries() {
 
 #[cfg(unix)]
 #[test]
+fn later_foreign_capture_files_cannot_advance_a_retired_root_floor() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-10.jsonl", b"{}\n");
+    let retired = retire_offline(&temp.0, CaptureLayout::Proxy).unwrap();
+    let before = fs::read(temp.state_path()).unwrap();
+    // An unrelated program can ignore advisory locking; its later pathname
+    // must not alter the immutable retirement contract during maintenance.
+    temp.write("rust-2026-10-12.jsonl", b"{\"foreign\":true}\n");
+    let mut options = options(CaptureLayout::Proxy);
+    options.now = DateTime::parse_from_rfc3339("2026-10-20T12:00:00Z").unwrap().with_timezone(&Utc);
+    options.before = day("2026-10-21");
+    let report = seal_offline(&temp.0, options).unwrap();
+    assert_eq!(report.sealed.len(), 1);
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|skip| skip.relative_path == "rust-2026-10-12.jsonl" && skip.reason == SealSkipReason::ActiveDay)
+    );
+    assert_eq!(fs::read(temp.state_path()).unwrap(), before);
+    assert_eq!(read_retirement(&temp.0).unwrap(), Some(retired));
+    assert!(read_seal(&temp.0, "rust-2026-10-12.jsonl").is_err());
+    assert_eq!(fs::read(temp.0.join("rust-2026-10-12.jsonl")).unwrap(), b"{\"foreign\":true}\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn retirement_publication_failures_stay_closed_and_resume_original_identity() {
     for stage in ["intent", "marker", "receipt"] {
         let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
