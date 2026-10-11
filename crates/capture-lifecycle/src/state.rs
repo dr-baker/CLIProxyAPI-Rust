@@ -5,14 +5,19 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{CaptureLayout, PROTOCOL_VERSION, ROOT_MARKER, STATE_DIRECTORY, files, seal};
+use crate::{
+    CaptureLayout, CaptureRetirementV1, PROTOCOL_VERSION, RETIREMENT_FILE, ROOT_MARKER, STATE_DIRECTORY, files, retire,
+    seal,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RootMarker {
-    protocol_version: u32,
-    root_uuid: Uuid,
-    layout: CaptureLayout,
+pub(crate) struct RootMarker {
+    pub protocol_version: u32,
+    pub root_uuid: Uuid,
+    pub layout: CaptureLayout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<CaptureRetirementV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +27,8 @@ pub(crate) struct RootState {
     pub root_uuid: Uuid,
     pub layout: CaptureLayout,
     pub capture_day_floor: NaiveDate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<CaptureRetirementV1>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,11 +40,16 @@ pub struct Enrollment {
     pub created: bool,
 }
 
-fn marker(state: &RootState) -> RootMarker {
-    RootMarker { protocol_version: state.protocol_version, root_uuid: state.root_uuid, layout: state.layout }
+pub(crate) fn marker(state: &RootState) -> RootMarker {
+    RootMarker {
+        protocol_version: state.protocol_version,
+        root_uuid: state.root_uuid,
+        layout: state.layout,
+        retirement: state.retirement.clone(),
+    }
 }
 
-fn validate(state: &RootState, layout: CaptureLayout) -> io::Result<()> {
+pub(crate) fn validate(state: &RootState, layout: CaptureLayout) -> io::Result<()> {
     if state.protocol_version != PROTOCOL_VERSION || state.layout != layout || state.root_uuid.is_nil() {
         return Err(files::invalid("capture lifecycle protocol, layout, or root UUID is invalid"));
     }
@@ -58,6 +70,7 @@ pub(crate) fn load_pair(root: &Path, layout: CaptureLayout) -> io::Result<RootSt
     if recorded != marker(&state) {
         return Err(files::invalid("capture root marker and state disagree"));
     }
+    retire::validate_binding(root, &state)?;
     Ok(state)
 }
 
@@ -89,12 +102,19 @@ pub(crate) fn enroll(root: &Path, layout: CaptureLayout, initial_day: NaiveDate)
     let marker_path = root.join(ROOT_MARKER);
     let initialized = std::fs::symlink_metadata(&state_path).is_ok()
         || std::fs::symlink_metadata(&marker_path).is_ok()
-        || root.join(STATE_DIRECTORY).join("seals").try_exists()?;
+        || root.join(STATE_DIRECTORY).join("seals").try_exists()?
+        || root.join(STATE_DIRECTORY).join(RETIREMENT_FILE).try_exists()?;
     // Existing initialized roots never recreate a missing permanent lock file.
     let _lock = files::lock_root(&root, !initialized)?;
     files::recover_staging(&root)?;
     let recorded: Option<RootMarker> = files::optional_json(&marker_path)?;
     let existing: Option<RootState> = files::optional_json(&state_path)?;
+    if existing.as_ref().is_some_and(|state| state.retirement.is_some())
+        || recorded.as_ref().is_some_and(|marker| marker.retirement.is_some())
+        || files::optional_json::<CaptureRetirementV1>(&root.join(STATE_DIRECTORY).join(RETIREMENT_FILE))?.is_some()
+    {
+        return Err(files::invalid("capture root is permanently retired; enrollment cannot reset it"));
+    }
     let (mut state, created) = match (recorded, existing) {
         (None, None) => {
             let seals = root.join(STATE_DIRECTORY).join("seals");
@@ -108,6 +128,7 @@ pub(crate) fn enroll(root: &Path, layout: CaptureLayout, initial_day: NaiveDate)
                 root_uuid: Uuid::new_v4(),
                 layout,
                 capture_day_floor: initial_day,
+                retirement: None,
             };
             // State first makes a crash resumable. A marker without state is an
             // invalid initialized root and can never become a fresh enrollment.
