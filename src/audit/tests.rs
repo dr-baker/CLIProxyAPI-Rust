@@ -428,3 +428,355 @@ fn writer_unwind_closes_files_before_the_previous_roots_can_be_reopened() {
     assert!(CaptureRoot::open(&dir, CaptureLayout::Proxy).is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn historic_root(day: NaiveDate) -> (Config, PathBuf, Root) {
+    let dir = std::env::temp_dir().join(format!("cliproxy-online-seal-{}", uuid::Uuid::new_v4()));
+    capture_lifecycle::enroll(&dir, CaptureLayout::Proxy, day).unwrap();
+    let cfg = Config { request_log: true, request_log_dir: dir.to_string_lossy().into(), ..Default::default() };
+    let root = Arc::new(CaptureHandle {
+        path: dir.clone(),
+        producer: Mutex::new(CaptureRoot::open(&dir, CaptureLayout::Proxy).unwrap()),
+    });
+    (cfg, dir, root)
+}
+
+fn synthetic_job(root: Root, day: NaiveDate, id: u64) -> Job {
+    Job {
+        path: root.path.join(format!("rust-{day}.jsonl")),
+        root,
+        observed_day: day,
+        record: json!({"timestamp": format!("{day}T00:00:00Z"), "request_id": id}),
+        bytes: 0,
+        summary: false,
+    }
+}
+
+fn capture_writer(root: &Root) -> CaptureWriter {
+    let roots = Arc::new(Mutex::new(HashMap::from([(root.path.clone(), root.clone())])));
+    CaptureWriter::new(roots, Arc::new(Mutex::new(ArchiveStats::default()))).unwrap()
+}
+
+#[test]
+fn daily_rotation_flushes_every_cached_byte_before_publishing_floor_and_seal() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (_, dir, root) = historic_root(day);
+    let mut writer = capture_writer(&root);
+    writer.write(&mut synthetic_job(root.clone(), day, 1)).unwrap();
+    // Leave bytes in the buffer to prove rotation flushes the old handle.
+    writer.current.as_mut().unwrap().file.write_all(b"{\"buffered\":true}\n").unwrap();
+    assert!(!std::fs::read_to_string(dir.join(format!("rust-{day}.jsonl"))).unwrap().contains("buffered"));
+    writer.maintain_at(next).unwrap();
+    assert!(writer.current.is_none());
+    assert_eq!(root.producer.lock().capture_day_floor(), next);
+    writer.finish().unwrap();
+    let seal = capture_lifecycle::read_seal(&dir, format!("rust-{day}.jsonl")).unwrap();
+    let bytes = std::fs::read(dir.join(format!("rust-{day}.jsonl"))).unwrap();
+    assert!(bytes.ends_with(b"{\"buffered\":true}\n"));
+    assert_eq!(seal.closed_length, bytes.len() as u64);
+    assert_eq!(seal.capture_day_floor, next);
+    drop(writer);
+    drop(root);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn delayed_queued_records_and_clock_rollback_never_append_to_the_sealed_file() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (_, dir, root) = historic_root(day);
+    let mut writer = capture_writer(&root);
+    writer.write(&mut synthetic_job(root.clone(), day, 1)).unwrap();
+    writer.write(&mut synthetic_job(root.clone(), next, 2)).unwrap();
+    let before = std::fs::read(dir.join(format!("rust-{day}.jsonl"))).unwrap();
+    writer.write(&mut synthetic_job(root.clone(), day, 3)).unwrap();
+    writer.maintain_at(day).unwrap();
+    writer.write(&mut synthetic_job(root.clone(), day.pred_opt().unwrap(), 4)).unwrap();
+    writer.finish().unwrap();
+    assert_eq!(std::fs::read(dir.join(format!("rust-{day}.jsonl"))).unwrap(), before);
+    assert!(capture_lifecycle::read_seal(&dir, format!("rust-{day}.jsonl")).is_ok());
+    let rows: Vec<Value> = std::fs::read_to_string(dir.join(format!("rust-{next}.jsonl")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.iter().map(|row| row["request_id"].as_u64().unwrap()).collect::<Vec<_>>(), [2, 3, 4]);
+    assert_eq!(rows[1]["timestamp"], format!("{day}T00:00:00Z"));
+    drop(writer);
+    drop(root);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failed_rotation_closes_the_handle_without_advancing_floor_or_sealing_after_restart() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (cfg, dir, root) = historic_root(day);
+    let mut current = None;
+    write_job(&mut synthetic_job(root.clone(), day, 1), &mut current).unwrap();
+    current.as_mut().unwrap().file.write_all(b"unflushed failure bytes").unwrap();
+    let error = write_job_with_io(
+        &mut synthetic_job(root.clone(), next, 2),
+        &mut current,
+        |current| close_capture_with(current, |_| Err(io::Error::other("synthetic close sync failure"))),
+        |_, _| panic!("new record cannot be written after old close fails"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(current.is_none());
+    assert_eq!(root.producer.lock().capture_day_floor(), day);
+    assert!(!dir.join(format!("rust-{next}.jsonl")).exists());
+    assert!(!std::fs::read_to_string(dir.join(format!("rust-{day}.jsonl"))).unwrap().contains("unflushed"));
+    drop(root);
+    let restarted = Audit::new(&cfg).unwrap();
+    restarted.record(3, "summary", "test", json!({})).unwrap();
+    restarted.shutdown().unwrap();
+    assert_eq!(restarted.stats().seal_blocked_files, 1);
+    assert!(capture_lifecycle::read_seal(&dir, format!("rust-{day}.jsonl")).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failed_record_with_a_complete_newline_is_durably_excluded_from_online_seals() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (cfg, dir, root) = historic_root(day);
+    let mut current = None;
+    let result = write_job_with_io(&mut synthetic_job(root.clone(), day, 1), &mut current, close_capture, |file, _| {
+        file.write_all(b"{\"complete_prefix\":true}\n")?;
+        file.flush()?;
+        Err(io::Error::other("synthetic post-flush failure"))
+    });
+    assert!(result.is_err());
+    assert!(current.is_none());
+    root.producer.lock().resolve(next, CaptureChannel::Proxy).unwrap();
+    let report = root.producer.lock().closed_file_sealer().unwrap().seal_closed_files(Utc::now()).unwrap();
+    assert!(report.sealed.is_empty());
+    assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::FailedCapture));
+    drop(root);
+    let restarted = Audit::new(&cfg).unwrap();
+    restarted.shutdown().unwrap();
+    assert_eq!(restarted.stats().seal_blocked_files, 1);
+    assert!(capture_lifecycle::read_seal(&dir, format!("rust-{day}.jsonl")).is_err());
+    assert_eq!(std::fs::read(dir.join(format!("rust-{day}.jsonl"))).unwrap(), b"{\"complete_prefix\":true}\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn startup_seals_closed_history_without_adding_requests() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let (cfg, dir, root) = historic_root(day);
+    let path = dir.join(format!("rust-{day}.jsonl"));
+    std::fs::write(&path, b"{\"historic\":true}\n").unwrap();
+    drop(root);
+    let audit = Audit::new(&cfg).unwrap();
+    audit.shutdown().unwrap();
+    let seal = capture_lifecycle::read_seal(&dir, format!("rust-{day}.jsonl")).unwrap();
+    assert_eq!(seal.closed_length, 18);
+    assert_eq!(audit.stats().written, 0);
+    assert_eq!(audit.stats().sealed_files, 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn background_hashes_leave_the_live_producer_and_capture_queue_available() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let (cfg, dir, root) = historic_root(day);
+    std::fs::write(dir.join(format!("rust-{day}.jsonl")), b"{\"historic\":true}\n").unwrap();
+    drop(root);
+    let open = Arc::new((StdMutex::new(false), Condvar::new()));
+    let wait = open.clone();
+    let (started, received) = mpsc::channel();
+    let (written, recorded) = mpsc::channel();
+    let audit = Arc::new(
+        Audit::with_archive_writer(&cfg, LIMITS, move |roots, stats| {
+            let seals = SealWorker::with_runner(stats.clone(), move |mut sealer| {
+                started.send(()).unwrap();
+                let (lock, ready) = &*wait;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                sealer.seal_closed_files(Utc::now())
+            })?;
+            Ok(ObservedCaptureWriter {
+                inner: CaptureWriter { current: None, roots, seals, maintenance_cursor: 0 },
+                written,
+            })
+        })
+        .unwrap(),
+    );
+    let gate = Gate { started: received, open };
+    gate.started.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(audit.record(1, "summary", "test", json!({})).unwrap(), Admission::Queued);
+    // This notification comes after real serialization, flush and fsync, while
+    // the old-file hash is still blocked. It proves capture itself progresses.
+    recorded.recv_timeout(Duration::from_secs(1)).unwrap();
+    let root = audit.directory.read().clone().unwrap();
+    assert!(root.producer.try_lock().is_some());
+    assert!(CaptureRoot::open(&dir, CaptureLayout::Proxy).is_err());
+    let drained = audit.clone();
+    let (done, finished) = mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        drained.shutdown().unwrap();
+        done.send(()).unwrap();
+    });
+    assert!(finished.recv_timeout(Duration::from_millis(30)).is_err());
+    gate.release();
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    shutdown.join().unwrap();
+    assert_eq!(audit.stats().written, 1);
+    drop(root);
+    assert!(CaptureRoot::open(&dir, CaptureLayout::Proxy).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+struct ObservedCaptureWriter {
+    inner: CaptureWriter,
+    written: mpsc::Sender<()>,
+}
+
+impl ArchiveWriter for ObservedCaptureWriter {
+    fn write(&mut self, job: &mut Job) -> io::Result<()> {
+        self.inner.write(job)?;
+        self.written.send(()).unwrap();
+        Ok(())
+    }
+    fn maintain(&mut self) -> io::Result<()> {
+        self.inner.maintain()
+    }
+    fn finish(&mut self) -> io::Result<()> {
+        self.inner.finish()
+    }
+}
+
+#[test]
+fn successful_other_roots_do_not_hide_seal_errors_and_retry_clears_only_its_root() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let (_, first, first_root) = historic_root(day);
+    let (_, second, second_root) = historic_root(day);
+    let stats = Arc::new(Mutex::new(ArchiveStats::default()));
+    let (entered, started) = mpsc::channel();
+    let (allow, released) = mpsc::channel();
+    let mut calls = 0;
+    let mut worker = SealWorker::with_runner(stats.clone(), move |mut sealer| {
+        calls += 1;
+        entered.send(calls).unwrap();
+        released.recv().unwrap();
+        if calls == 1 {
+            Err(io::Error::other("synthetic receipt publication failure"))
+        } else {
+            sealer.seal_closed_files(Utc::now())
+        }
+    })
+    .unwrap();
+    worker.submit(&first_root).unwrap();
+    assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+    worker.submit(&second_root).unwrap();
+    allow.send(()).unwrap();
+    assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+    assert_eq!(stats.lock().seal_failed_roots, 1);
+    worker.submit(&first_root).unwrap();
+    allow.send(()).unwrap();
+    assert_eq!(started.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+    // The second root has now succeeded, and the first root's retry has started.
+    assert_eq!(stats.lock().seal_failed_roots, 1);
+    assert_eq!(stats.lock().last_seal_error_kind.as_deref(), Some("Other"));
+    allow.send(()).unwrap();
+    worker.finish().unwrap();
+    assert_eq!(stats.lock().seal_failed_roots, 0);
+    assert_eq!(stats.lock().last_seal_error_kind, None);
+    assert_eq!(stats.lock().seal_errors, 1);
+    assert_eq!(stats.lock().seal_pending_roots, 0);
+    drop(first_root);
+    drop(second_root);
+    std::fs::remove_dir_all(first).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}
+
+#[test]
+fn successful_old_snapshot_cannot_clear_a_newer_failure_for_the_same_root() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let (_, dir, root) = historic_root(day);
+    let stats = Arc::new(Mutex::new(ArchiveStats::default()));
+    let (entered, started) = mpsc::channel();
+    let (allow, released) = mpsc::channel();
+    let mut worker = SealWorker::with_runner(stats.clone(), move |mut sealer| {
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+        sealer.seal_closed_files(Utc::now())
+    })
+    .unwrap();
+    worker.submit(&root).unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    worker.record_error(&root.path, &io::Error::other("newer floor publication failure"));
+    allow.send(()).unwrap();
+    worker.finish().unwrap();
+    assert_eq!(stats.lock().seal_errors, 1);
+    assert_eq!(stats.lock().seal_failed_roots, 1);
+    assert_eq!(stats.lock().last_seal_error_kind.as_deref(), Some("Other"));
+    drop(root);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_new_file_open_cannot_retain_the_old_writable_handle() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (_, dir, root) = historic_root(day);
+    let mut writer = capture_writer(&root);
+    writer.write(&mut synthetic_job(root.clone(), day, 1)).unwrap();
+    writer.current.as_mut().unwrap().file.write_all(b"{\"buffered\":true}\n").unwrap();
+    std::fs::create_dir(dir.join(format!("rust-{next}.jsonl"))).unwrap();
+    assert!(writer.write(&mut synthetic_job(root.clone(), next, 2)).is_err());
+    assert!(writer.current.is_none());
+    assert_eq!(root.producer.lock().capture_day_floor(), next);
+    // Remove only the fixture directory which deliberately obstructed the open.
+    // Discovery rejects invalid source entries, so the queued seal pass may
+    // have failed first. A new pass must safely retry after that obstruction.
+    writer.seals.finish().unwrap();
+    std::fs::remove_dir(dir.join(format!("rust-{next}.jsonl"))).unwrap();
+    let seal = root.producer.lock().closed_file_sealer().unwrap().seal_closed_files(Utc::now()).unwrap();
+    assert_eq!(seal.sealed.len() + seal.already_sealed, 1);
+    assert!(std::fs::read(dir.join(format!("rust-{day}.jsonl"))).unwrap().ends_with(b"{\"buffered\":true}\n"));
+    drop(writer);
+    drop(root);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn root_switches_close_cached_handles_and_delayed_jobs_keep_their_original_root() {
+    let day = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let next = day.succ_opt().unwrap();
+    let (_, first, first_root) = historic_root(day);
+    let (_, second, second_root) = historic_root(day);
+    let roots = Arc::new(Mutex::new(HashMap::from([
+        (first.clone(), first_root.clone()),
+        (second.clone(), second_root.clone()),
+    ])));
+    let mut writer = CaptureWriter::new(roots, Arc::new(Mutex::new(ArchiveStats::default()))).unwrap();
+    writer.write(&mut synthetic_job(first_root.clone(), day, 1)).unwrap();
+    writer.current.as_mut().unwrap().file.write_all(b"{\"buffered_first\":true}\n").unwrap();
+    writer.write(&mut synthetic_job(second_root.clone(), next, 2)).unwrap();
+    assert!(Arc::ptr_eq(&writer.current.as_ref().unwrap().root, &second_root));
+    let first_bytes = std::fs::read(first.join(format!("rust-{day}.jsonl"))).unwrap();
+    assert!(first_bytes.ends_with(b"{\"buffered_first\":true}\n"));
+    writer.maintain_at(next).unwrap();
+    writer.write(&mut synthetic_job(first_root.clone(), day, 3)).unwrap();
+    assert!(Arc::ptr_eq(&writer.current.as_ref().unwrap().root, &first_root));
+    writer.finish().unwrap();
+    assert_eq!(std::fs::read(first.join(format!("rust-{day}.jsonl"))).unwrap(), first_bytes);
+    let late: Value =
+        serde_json::from_str(std::fs::read_to_string(first.join(format!("rust-{next}.jsonl"))).unwrap().trim())
+            .unwrap();
+    assert_eq!(late["request_id"], 3);
+    let second_row: Value =
+        serde_json::from_str(std::fs::read_to_string(second.join(format!("rust-{next}.jsonl"))).unwrap().trim())
+            .unwrap();
+    assert_eq!(second_row["request_id"], 2);
+    drop(writer);
+    drop(first_root);
+    drop(second_root);
+    std::fs::remove_dir_all(first).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}

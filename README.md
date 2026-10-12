@@ -377,7 +377,7 @@ The local request archive serializes and writes records on one dedicated thread.
 
 The queue allows 1,024 records and a conservative 64 MiB estimate of owned record memory, including the record being written. Payloads may use 960 records and 60 MiB; the remaining capacity is reserved for request summaries. Individual records above 16 MiB or nested deeper than 128 levels are dropped. If the queue fills, records are dropped rather than blocking request workers.
 
-The management overview exposes archive queue size, written records, dropped payloads, dropped summaries, and write errors. Live request totals remain independent of archive coverage. A queued record is not yet durable: the writer flushes each record and calls `sync_all` for summaries. Normal server shutdown drains accepted records and can wait for disk I/O. A crash can lose queued records; a partial write can leave an incomplete JSONL tail.
+The management overview exposes archive queue size, written records, dropped payloads, dropped summaries, and write errors. Sealing counters report completed seals, seal errors, and failed captures protected from cleanup. Live request totals remain independent of archive coverage. A queued record is not yet durable: the writer flushes each record and calls `sync_all` for summaries. Normal server shutdown drains accepted records and can wait for disk I/O. A crash can lose queued records; a partial write can leave an incomplete JSONL tail.
 
 Every archive wrapper includes a `process_instance_id` UUID generated once per proxy process. Combine it with `request_id` to join records without PID reuse ambiguity. It stays stable across capture config reloads and changes after a process restart. Original wire data stays inside `data`, including any original fields with the same name. The persistent capture root UUID identifies storage separately.
 
@@ -393,7 +393,11 @@ cliproxyapi-rust archive enroll --directory ./request-logs
 
 Start the proxy after enrollment. A second producer fails immediately. Config reloads retain the guards for previous capture directories until the writer drains and closes its files. Invalid capture configuration is rejected before management endpoints rewrite the config file.
 
-To seal historical files, stop and drain the proxy, then run:
+The proxy automatically seals closed captures at startup, after daily rotation, and during five-minute maintenance. Rotation flushes, syncs, and closes the old writable handle before advancing the durable storage-day floor. A separate thread hashes up to two closed files per pass. At most one pass runs and one waits, so hashing does not hold the live producer mutex or build an unbounded queue. Failed publication is retried during maintenance.
+
+Seals prove producer closure and bind the exact source identity, length, and SHA-256. The Codex Meta importer separately proves database recovery before optional cleanup and preserves the latest two files and hot days. This bounds retained raw captures without removing native transcripts. A known write, flush, or sync failure creates a durable exclusion marker; that capture stays raw across restarts. Preserve the marker for later investigation. If the marker itself cannot be saved, the running producer fails closed and reports an error. A restart cannot recover failure evidence that storage did not save.
+
+To seal files manually, stop and drain the proxy, then run:
 
 ```sh
 cliproxyapi-rust archive seal --directory ./request-logs --before 2026-10-01

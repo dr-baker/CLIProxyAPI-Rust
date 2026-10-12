@@ -539,6 +539,253 @@ fn lock_process_probe() {
 
 #[cfg(unix)]
 #[test]
+fn online_ticket_retains_the_original_lock_after_producer_drop() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-09.jsonl", b"{}\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    drop(root);
+    let denied = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::lock_process_probe", "--ignored"])
+        .env("CAPTURE_TEST_ROOT", &temp.0)
+        .env("CAPTURE_TEST_BLOCKED", "1")
+        .output()
+        .unwrap();
+    assert!(denied.status.success(), "{}", String::from_utf8_lossy(&denied.stderr));
+    assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_err());
+    assert_eq!(ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap().sealed.len(), 1);
+    drop(ticket);
+    assert!(CaptureRoot::open(&temp.0, CaptureLayout::Proxy).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn online_snapshot_does_not_advance_or_expand_its_closed_floor() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-09.jsonl", b"{\"sequence\":1}\n");
+    temp.write("rust-2026-10-10.jsonl", b"{\"sequence\":2}\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    let (_, mut file) = root.open_append(day("2026-10-11"), CaptureChannel::Proxy).unwrap();
+    file.write_all(b"{\"sequence\":3}\n").unwrap();
+    file.sync_all().unwrap();
+    // The current writer can remain open while the old-floor ticket hashes.
+    let report = ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert_eq!(report.sealed.len(), 1);
+    assert_eq!(report.sealed[0].relative_path, "rust-2026-10-09.jsonl");
+    assert_eq!(report.sealed[0].capture_day_floor, day("2026-10-10"));
+    assert_eq!(root.capture_day_floor(), day("2026-10-11"));
+    assert!(read_seal(&temp.0, "rust-2026-10-10.jsonl").is_err());
+    drop(file);
+    let mut later = root.closed_file_sealer().unwrap();
+    assert_eq!(later.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap().sealed.len(), 1);
+    assert!(root.resolve(day("2026-10-09"), CaptureChannel::Proxy).unwrap().ends_with("rust-2026-10-11.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn online_seals_skip_full_hashes_on_retry_and_survive_source_removal() {
+    let temp = Temp::enrolled(CaptureLayout::Otel, "2026-10-10");
+    temp.write("2026-10-09/logs.jsonl", b"{\"signal\":\"logs\"}\n");
+    temp.write("2026-10-09/traces.jsonl", b"{\"signal\":\"traces\"}\n");
+    temp.write("2026-10-10/logs.jsonl", b"current\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Otel).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    let now = options(CaptureLayout::Otel).now;
+    let first = ticket.seal_closed_files(now).unwrap();
+    assert_eq!(first.sealed.len(), 2);
+    seal::SOURCE_BYTES_READ.with(|counter| counter.set(0));
+    let second = ticket.seal_closed_files(now).unwrap();
+    assert!(second.sealed.is_empty());
+    assert_eq!(second.already_sealed, 2);
+    assert_eq!(seal::SOURCE_BYTES_READ.with(|counter| counter.get()), 0);
+    fs::remove_file(temp.0.join("2026-10-09/logs.jsonl")).unwrap();
+    assert!(ticket.seal_closed_files(now).is_ok());
+    assert!(read_seal(&temp.0, "2026-10-09/logs.jsonl").is_ok());
+    let target = temp.0.join("2026-10-09/traces.jsonl");
+    let quarantine = temp.0.join("quarantined.raw");
+    online::AFTER_DISCOVERY
+        .with(|hook| *hook.borrow_mut() = Some(Box::new(move || fs::rename(target, quarantine).unwrap())));
+    assert_eq!(ticket.seal_closed_files(now).unwrap().already_sealed, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn online_partial_tail_inspection_reads_one_byte_and_preserves_sources() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    let partial = vec![b'x'; 3 << 20];
+    temp.write("rust-2026-10-08.jsonl", &partial);
+    temp.write("rust-2026-10-09.jsonl", b"");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    seal::SOURCE_BYTES_READ.with(|counter| counter.set(0));
+    let report = ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert_eq!(report.sealed.len(), 1);
+    assert_eq!(report.sealed[0].closed_length, 0);
+    assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::PartialTail));
+    assert_eq!(seal::SOURCE_BYTES_READ.with(|counter| counter.get()), 1);
+    assert_eq!(fs::read(temp.0.join("rust-2026-10-08.jsonl")).unwrap(), partial);
+    assert!(read_seal(&temp.0, "rust-2026-10-08.jsonl").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn online_hash_budget_progresses_without_rehashing_previous_seals() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    fill_proxy(&temp);
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    let now = options(CaptureLayout::Proxy).now;
+    assert!(ticket.seal_closed_files_bounded(now, 0).is_err());
+    for pass in 0..4 {
+        seal::SOURCE_BYTES_READ.with(|counter| counter.set(0));
+        let report = ticket.seal_closed_files_bounded(now, 2).unwrap();
+        assert_eq!(report.sealed.len(), 2);
+        assert_eq!(report.already_sealed, pass * 2);
+        assert_eq!(seal::SOURCE_BYTES_READ.with(|counter| counter.get()), 8);
+        assert_eq!(report.skipped.iter().filter(|skip| skip.reason == SealSkipReason::Deferred).count(), 7 - pass * 2);
+    }
+    let final_report = ticket.seal_closed_files_bounded(now, 2).unwrap();
+    assert_eq!(final_report.sealed.len(), 1);
+    assert_eq!(final_report.already_sealed, 8);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_capture_exclusion_is_durable_and_applies_to_offline_seals() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-01");
+    fill_proxy(&temp);
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    root.block_sealing("rust-2026-10-01.jsonl").unwrap();
+    root.block_sealing("rust-2026-10-01.jsonl").unwrap();
+    root.resolve(day("2026-10-10"), CaptureChannel::Proxy).unwrap();
+    drop(root);
+    let mut restarted = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = restarted.closed_file_sealer().unwrap();
+    let report = ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert_eq!(report.sealed.len(), 8);
+    assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::FailedCapture));
+    assert!(read_seal(&temp.0, "rust-2026-10-01.jsonl").is_err());
+    assert_eq!(fs::read(temp.0.join("rust-2026-10-01.jsonl")).unwrap(), b"{}\n");
+    drop(ticket);
+    drop(restarted);
+    let report = seal_offline(&temp.0, options(CaptureLayout::Proxy)).unwrap();
+    assert!(report.skipped.iter().any(|skip| skip.reason == SealSkipReason::FailedCapture));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_exclusion_publication_poisons_current_producer() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-10.jsonl", b"complete\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    // Create the exclusion directory before injecting publication failure.
+    drop(root.closed_file_sealer().unwrap());
+    files::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
+    assert!(root.block_sealing("rust-2026-10-10.jsonl").is_err());
+    assert!(root.closed_file_sealer().is_err());
+    assert!(root.open_append(day("2026-10-10"), CaptureChannel::Proxy).is_err());
+    drop(root);
+    let mut restarted = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    restarted.resolve(day("2026-10-11"), CaptureChannel::Proxy).unwrap();
+    let mut ticket = restarted.closed_file_sealer().unwrap();
+    let report = ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert!(report.sealed.is_empty());
+    assert_eq!(report.skipped[0].reason, SealSkipReason::FailedCapture);
+}
+
+#[cfg(unix)]
+#[test]
+fn failure_exclusion_cannot_invalidate_a_closed_or_already_sealed_path() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-09.jsonl", b"complete\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert!(root.block_sealing("rust-2026-10-09.jsonl").is_err());
+    assert!(read_seal(&temp.0, "rust-2026-10-09.jsonl").is_ok());
+    assert!(fs::read_dir(temp.0.join(STATE_DIRECTORY).join("seal-blocks")).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn online_seal_retry_syncs_existing_receipt_without_payload_reads() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-09.jsonl", b"complete\n");
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut ticket = root.closed_file_sealer().unwrap();
+    online::AFTER_DISCOVERY.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| files::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true))))
+    });
+    assert!(ticket.seal_closed_files(options(CaptureLayout::Proxy).now).is_err());
+    assert!(read_seal(&temp.0, "rust-2026-10-09.jsonl").is_ok());
+    seal::SOURCE_BYTES_READ.with(|counter| counter.set(0));
+    files::DIRECTORY_SYNCS.with(|trace| trace.borrow_mut().clear());
+    let report = ticket.seal_closed_files(options(CaptureLayout::Proxy).now).unwrap();
+    assert_eq!(report.already_sealed, 1);
+    assert_eq!(seal::SOURCE_BYTES_READ.with(|counter| counter.get()), 0);
+    let directory = fs::canonicalize(temp.0.join(STATE_DIRECTORY).join("seals")).unwrap();
+    assert!(files::DIRECTORY_SYNCS.with(|trace| trace.borrow().contains(&directory)));
+}
+
+#[cfg(unix)]
+#[test]
+fn online_ticket_rejects_replaced_namespaces_before_source_hashes() {
+    for target in ["root", "state", "seals", "blocks", "lock"] {
+        let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+        temp.write("rust-2026-10-09.jsonl", b"complete\n");
+        let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+        let mut ticket = root.closed_file_sealer().unwrap();
+        let path = match target {
+            "root" => temp.0.clone(),
+            "state" => temp.0.join(STATE_DIRECTORY),
+            "seals" => temp.0.join(STATE_DIRECTORY).join("seals"),
+            "blocks" => temp.0.join(STATE_DIRECTORY).join("seal-blocks"),
+            "lock" => temp.0.join(STATE_DIRECTORY).join("producer.lock"),
+            _ => unreachable!(),
+        };
+        let displaced = temp.0.with_extension(format!("displaced-{target}"));
+        fs::rename(&path, &displaced).unwrap();
+        if target == "lock" {
+            fs::write(&path, b"").unwrap();
+        } else {
+            fs::create_dir(&path).unwrap();
+        }
+        seal::SOURCE_BYTES_READ.with(|counter| counter.set(0));
+        assert!(ticket.seal_closed_files(options(CaptureLayout::Proxy).now).is_err());
+        assert_eq!(seal::SOURCE_BYTES_READ.with(|counter| counter.get()), 0);
+        drop(ticket);
+        drop(root);
+        if target == "lock" {
+            fs::remove_file(&path).unwrap();
+        } else {
+            fs::remove_dir(&path).unwrap();
+        }
+        fs::rename(displaced, path).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_online_tickets_publish_one_immutable_proof_per_source() {
+    let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
+    temp.write("rust-2026-10-09.jsonl", &vec![b'\n'; 3 << 20]);
+    let mut root = CaptureRoot::open(&temp.0, CaptureLayout::Proxy).unwrap();
+    let mut first = root.closed_file_sealer().unwrap();
+    let mut second = root.closed_file_sealer().unwrap();
+    let now = options(CaptureLayout::Proxy).now;
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(move || first.seal_closed_files(now));
+        let second = scope.spawn(move || second.seal_closed_files(now));
+        (first.join().unwrap().unwrap(), second.join().unwrap().unwrap())
+    });
+    assert_eq!(first.sealed.len() + second.sealed.len(), 1);
+    assert_eq!(first.already_sealed + second.already_sealed, 1);
+    assert_eq!(read_seal(&temp.0, "rust-2026-10-09.jsonl").unwrap().closed_length, 3 << 20);
+}
+
+#[cfg(unix)]
+#[test]
 fn seal_preserves_union_of_filename_mtime_hot_and_active_exclusions() {
     let temp = Temp::enrolled(CaptureLayout::Proxy, "2026-10-10");
     fill_proxy(&temp);

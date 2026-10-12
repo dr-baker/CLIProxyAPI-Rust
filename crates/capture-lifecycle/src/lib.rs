@@ -4,6 +4,7 @@
 //! All producers of a root must honor this protocol; legacy writers must stop first.
 
 mod files;
+mod online;
 mod retire;
 mod seal;
 mod state;
@@ -16,6 +17,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use online::ClosedFileSealer;
 pub use retire::{CaptureRetirementV1, read_retirement, retire_offline};
 pub use seal::{
     CaptureSealV1, FileIdentity, SealOptions, SealReport, SealSkip, SealSkipReason, read_seal, seal_offline,
@@ -111,6 +113,27 @@ impl CaptureRoot {
 
     pub fn capture_day_floor(&self) -> NaiveDate {
         self.state.capture_day_floor
+    }
+
+    /// Create background sealing work without acquiring the producer lock again.
+    /// Before calling, flush, sync, and drop every writable capture handle whose
+    /// storage day is below the persisted floor. The ticket retains ownership of
+    /// the producer lock and never seals files at or above this snapshot's floor.
+    /// Later writes and floor advances can continue while its hashes run.
+    pub fn closed_file_sealer(&mut self) -> io::Result<ClosedFileSealer> {
+        online::prepare(self)
+    }
+
+    /// Permanently exclude a canonical relative capture path after a failed
+    /// append, flush, or sync, before advancing its current storage day. A sealed
+    /// path cannot gain a later exclusion. The raw bytes remain untouched. If
+    /// this durable exclusion cannot be written, the producer refuses writes.
+    pub fn block_sealing(&mut self, relative_path: impl AsRef<Path>) -> io::Result<()> {
+        let result = online::block(self, relative_path.as_ref());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Resolve on the writer, immediately before opening a capture file. The
