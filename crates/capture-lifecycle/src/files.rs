@@ -205,7 +205,12 @@ fn validate_regular_file(file: &File) -> io::Result<()> {
 /// crash after no-overwrite publication can leave a second link to the complete
 /// receipt/state marker; removing the staging name restores its single identity.
 pub(crate) fn recover_staging(root: &Path) -> io::Result<()> {
-    for directory in [root.to_owned(), root.join(STATE_DIRECTORY), root.join(STATE_DIRECTORY).join("seals")] {
+    for directory in [
+        root.to_owned(),
+        root.join(STATE_DIRECTORY),
+        root.join(STATE_DIRECTORY).join("seals"),
+        root.join(STATE_DIRECTORY).join("seal-blocks"),
+    ] {
         if !directory.try_exists()? {
             continue;
         }
@@ -325,6 +330,11 @@ pub(crate) fn observe_directory_sync(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn sync_lifecycle(root: &Path) -> io::Result<()> {
+    let blocks = root.join(STATE_DIRECTORY).join("seal-blocks");
+    if blocks.try_exists()? {
+        require_directory(&blocks)?;
+        sync_directory(&blocks)?;
+    }
     for directory in [root.join(STATE_DIRECTORY).join("seals"), root.join(STATE_DIRECTORY), root.to_owned()] {
         require_directory(&directory)?;
         sync_directory(&directory)?;

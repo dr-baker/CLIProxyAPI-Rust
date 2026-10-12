@@ -58,6 +58,7 @@ pub(crate) fn validate(state: &RootState, layout: CaptureLayout) -> io::Result<(
 
 pub(crate) fn load(root: &Path, layout: CaptureLayout) -> io::Result<RootState> {
     let state = load_pair(root, layout)?;
+    crate::online::validate_blocks(root, &state)?;
     seal::validate_receipts(root, &state)?;
     Ok(state)
 }
@@ -157,6 +158,7 @@ pub(crate) fn enroll(root: &Path, layout: CaptureLayout, initial_day: NaiveDate)
         state.capture_day_floor = initial_day;
         persist(&root, &state)?;
     }
+    crate::online::validate_blocks(&root, &state)?;
     files::sync_lifecycle(&root)?;
     Ok(Enrollment {
         protocol_version: PROTOCOL_VERSION,

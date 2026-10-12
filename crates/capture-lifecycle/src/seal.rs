@@ -69,6 +69,8 @@ pub enum SealSkipReason {
     RecentMtime,
     Hot,
     PartialTail,
+    FailedCapture,
+    Deferred,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,12 +86,12 @@ pub struct SealReport {
     pub skipped: Vec<SealSkip>,
 }
 
-struct Candidate {
-    relative: PathBuf,
-    day: NaiveDate,
-    channel: CaptureChannel,
-    fingerprint: files::Fingerprint,
-    parent_identity: FileIdentity,
+pub(crate) struct Candidate {
+    pub relative: PathBuf,
+    pub day: NaiveDate,
+    pub channel: CaptureChannel,
+    pub fingerprint: files::Fingerprint,
+    pub parent_identity: FileIdentity,
 }
 
 #[cfg(test)]
@@ -185,6 +187,13 @@ pub fn seal_offline(root: impl AsRef<Path>, options: SealOptions) -> io::Result<
     // If the process stops here, the floor still forbids future appends. The
     // source remains raw and has no removal proof until a later run publishes it.
     for candidate in selected {
+        if crate::online::is_blocked(&producer.root, &producer.state, &candidate.relative)? {
+            report.skipped.push(SealSkip {
+                relative_path: relative_string(&candidate.relative)?,
+                reason: SealSkipReason::FailedCapture,
+            });
+            continue;
+        }
         let snapshot = hash_stable_source(&producer.root, &candidate)?;
         let existing = read_optional_receipt(&producer.root, &candidate.relative)?;
         if let Some(existing) = existing {
@@ -242,6 +251,9 @@ pub fn read_seal(root: impl AsRef<Path>, relative_path: impl AsRef<Path>) -> io:
     let receipt = read_optional_receipt(&root, relative)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "capture seal is missing"))?;
     validate_receipt(&receipt, &state, relative)?;
+    if crate::online::is_blocked(&root, &state, relative)? {
+        return Err(files::invalid("capture seal is blocked by a failed capture"));
+    }
     Ok(receipt)
 }
 
@@ -261,6 +273,9 @@ pub(crate) fn validate_receipts(root: &Path, state: &state::RootState) -> io::Re
         let receipt: CaptureSealV1 = files::read_json(&entry.path())?;
         let relative = Path::new(&receipt.relative_path);
         validate_receipt(&receipt, state, relative)?;
+        if crate::online::is_blocked(root, state, relative)? {
+            return Err(files::invalid("capture seal is blocked by a failed capture"));
+        }
         if entry.path() != receipt_path(root, relative)? {
             return Err(files::invalid("capture seal filename does not match its source path"));
         }
@@ -268,7 +283,7 @@ pub(crate) fn validate_receipts(root: &Path, state: &state::RootState) -> io::Re
     Ok(())
 }
 
-fn validate_receipt(receipt: &CaptureSealV1, state: &state::RootState, relative: &Path) -> io::Result<()> {
+pub(crate) fn validate_receipt(receipt: &CaptureSealV1, state: &state::RootState, relative: &Path) -> io::Result<()> {
     let (day, channel) = parse_relative(state.layout, relative)?;
     if receipt.protocol_version != PROTOCOL_VERSION
         || receipt.root_uuid != state.root_uuid
@@ -286,17 +301,17 @@ fn validate_receipt(receipt: &CaptureSealV1, state: &state::RootState, relative:
     files::validate_day(receipt.capture_day_floor)
 }
 
-fn receipt_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
+pub(crate) fn receipt_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     let relative = relative_string(relative)?;
     let name = format!("{}.json", hex::encode(Sha256::digest(relative.as_bytes())));
     Ok(root.join(STATE_DIRECTORY).join("seals").join(name))
 }
 
-fn relative_string(relative: &Path) -> io::Result<String> {
+pub(crate) fn relative_string(relative: &Path) -> io::Result<String> {
     relative.to_str().map(str::to_owned).ok_or_else(|| files::invalid("capture path must be UTF-8"))
 }
 
-fn read_optional_receipt(root: &Path, relative: &Path) -> io::Result<Option<CaptureSealV1>> {
+pub(crate) fn read_optional_receipt(root: &Path, relative: &Path) -> io::Result<Option<CaptureSealV1>> {
     files::optional_json(&receipt_path(root, relative)?)
 }
 
@@ -344,7 +359,7 @@ pub(crate) fn closed_root_floor(root: &Path, layout: CaptureLayout, existing: Na
     }
 }
 
-fn add_candidate(
+pub(crate) fn add_candidate(
     root: &Path,
     relative: PathBuf,
     day: NaiveDate,
@@ -379,11 +394,11 @@ fn newest(candidates: &[Candidate], layout: CaptureLayout, keep: usize, mtime: b
     protected
 }
 
-struct Snapshot {
-    identity: FileIdentity,
-    length: u64,
-    sha256: String,
-    newline: bool,
+pub(crate) struct Snapshot {
+    pub identity: FileIdentity,
+    pub length: u64,
+    pub sha256: String,
+    pub newline: bool,
 }
 
 pub(crate) fn require_identity_support() -> io::Result<()> {
@@ -397,7 +412,7 @@ pub(crate) fn require_identity_support() -> io::Result<()> {
     }
 }
 
-fn hash_stable_source(root: &Path, candidate: &Candidate) -> io::Result<Snapshot> {
+pub(crate) fn hash_stable_source(root: &Path, candidate: &Candidate) -> io::Result<Snapshot> {
     let parent = files::CaptureParent::open(root, &candidate.relative, false)?;
     if parent.identity()? != candidate.parent_identity {
         return Err(files::invalid("capture parent changed since seal discovery"));

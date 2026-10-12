@@ -1,6 +1,6 @@
 # Capture lifecycle reference
 
-`capture-lifecycle` coordinates daily JSONL producers and offline file closure. It stores metadata beside existing raw capture files. The proxy and a local OpenTelemetry collector can share this crate through path or pinned Git dependencies.
+`capture-lifecycle` coordinates daily JSONL producers and durable file closure. It stores metadata beside existing raw capture files. The proxy and a local OpenTelemetry collector can share this crate through path or pinned Git dependencies.
 
 ## Enrollment and producer ownership
 
@@ -41,9 +41,29 @@ The operation advances the day floor before it hashes any selected source or pub
 
 Receipts publish without overwriting existing receipts. Repeated sealing verifies the same identity and bytes. A mismatch is an error. A failure can leave the floor advanced with no receipt; rerunning the operation completes closure. Recovery under the root lock removes only this crate's staged metadata files. It preserves capture payloads. Enrollment and offline recovery resync lifecycle directories and a bounded ancestor chain before acknowledging success, including visible entries left by a failed publication. Opening an append handle resyncs its validated parent even when the capture leaf already exists. These checks cover retries after a successful create or publication followed by a failed directory sync.
 
+## Online closure
+
+`CaptureRoot::closed_file_sealer()` creates a `ClosedFileSealer` while the producer owns its root. Before this call, the producer flushes, syncs, and drops every writable handle below its persisted day floor. This caller guarantee is required because `CaptureRoot` cannot track returned `File` handles.
+
+The ticket duplicates the existing lock handle and retains the root, state directory, seal directory, and exclusion directory handles. It holds the producer lock even after the original `CaptureRoot` drops. The ticket can move to a background maintenance thread while capture continues. It never advances the day floor. Later producer floor advances leave its original snapshot unchanged.
+
+`ticket.seal_closed_files(now)` seals complete raw files strictly below the snapshot floor. `ticket.seal_closed_files_bounded(now, max_files)` limits new full-file hashes in a pass. Both methods require a mutable ticket. The maximum hash budget is 100,000 files. The budget does not limit one file's size or hashing time.
+
+Online closure can seal recent closed files. The archive consumer still preserves its latest-file and hot-window exclusions before removal. A receipt alone grants no deletion permission. Native transcripts have no supported capture layout.
+
+Before a new hash, the ticket checks the final byte with a one-byte read. An empty file qualifies. A partial tail stays raw and unsealed, without a full-file read on every retry. Stable full-file hashing uses the same source sync, SHA-256, and identity checks as offline sealing. The ticket revalidates its retained directories, producer lock, root UUID, and monotonic floor before publishing each receipt.
+
+Existing receipts require matching current source identity and length but no repeated payload hash. Archive verification separately proves the exact bytes before removal. Missing originals with existing receipts remain valid, including an archive quarantine that races discovery. Concurrent tickets can publish one immutable receipt for the same bytes. A retry after publication sync failure resyncs the seal directory without rereading payloads.
+
+`CaptureRoot::block_sealing(relative_path)` records an immutable exclusion after a failed append, flush, or sync, before the producer advances that storage day. Only its current day qualifies. An existing seal cannot gain a later exclusion, so readers of the original receipt format remain safe. The canonical relative path, root UUID, layout, and failure timestamp persist in `.capture-state/seal-blocks/`. Online and offline sealing report `FailedCapture` and preserve those bytes. Hash budgets report `Deferred`. Files at or above the snapshot floor report `ActiveDay`, and incomplete final lines report `PartialTail`.
+
+If an exclusion write fails, the current producer refuses further capture and ticket creation. A failed directory sync can leave a visible exclusion that startup resyncs. If no exclusion reaches storage before a process exits, a later restart cannot infer that failure. Raw bytes and archive byte-equality checks remain intact, but that failed path may later qualify for a seal. This protocol does not write a durable intent before every captured record.
+
+The production callers use one background worker per root and retry at least five minutes apart. Startup and day rotation can queue new work. A pass hashes at most four files. Sealing adds no payload scans to individual capture requests.
+
 ## Persistent metadata
 
-Each enrolled root contains `.capture-root.json` and `.capture-state/`. The state directory contains `producer.lock`, `state.json`, and `seals/`. Never delete, replace, or copy these files to reset enrollment. Keep lifecycle metadata after raw capture retirement. The lock pathname remains permanent.
+Each enrolled root contains `.capture-root.json` and `.capture-state/`. The state directory contains `producer.lock`, `state.json`, and `seals/`. Online producers also use `seal-blocks/`. Never delete, replace, or copy these files to reset enrollment. Keep lifecycle metadata after raw capture retirement. The lock pathname remains permanent.
 
 The root marker binds protocol version, root UUID, and layout. The state adds `capture_day_floor`. Each seal filename is the SHA-256 of its canonical relative capture path, with a `.json` suffix. A `CaptureSealV1` contains these fields:
 
